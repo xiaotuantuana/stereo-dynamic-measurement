@@ -1,0 +1,31 @@
+.worktrees/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime and experiment outputs
+stereo_app_outputs/
+stereo_point_cloud_outputs/
+experiments/**/results/
+experiments/**/report/
+experiments/**/report_*/
+
+# Large local assets and generated model artifacts
+*.avi
+*.mp4
+*.mov
+*.mkv
+*.pt
+*.pth
+*.onnx
+*.engine
+*.wts
+*.dll
+*.pdb
+*.obj
+*.lib
+*.zip
