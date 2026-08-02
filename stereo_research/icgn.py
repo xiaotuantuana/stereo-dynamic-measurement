@@ -14,8 +14,18 @@ class ICGNResult:
     iterations: int = 0
     residual_rms: float | None = None
     hessian: float | None = None
+    hessian_density: float | None = None
+    # Deprecated compatibility field.  True photometric curvature is computed
+    # by LocalMatcher at the final disparity, not by the IC-GN Hessian.
     cost_curvature: float | None = None
     converged: bool = False
+    fallback_used: bool = False
+    fallback_method: str = "none"
+    initial_disparity: float | None = None
+    iterative_disparity: float | None = None
+    final_disparity: float | None = None
+    final_increment_px: float | None = None
+    termination_reason: str = ""
 
 
 def refine_disparity_icgn(
@@ -28,6 +38,7 @@ def refine_disparity_icgn(
     max_iterations: int,
     epsilon: float,
     max_offset: float,
+    max_residual: float = float("inf"),
 ) -> ICGNResult:
     if left_gray.ndim != 2 or right_gray.ndim != 2:
         raise ValueError("IC-GN expects grayscale images")
@@ -38,19 +49,35 @@ def refine_disparity_icgn(
     if max_iterations <= 0 or epsilon <= 0 or max_offset <= 0:
         raise ValueError("IC-GN iteration controls must be positive")
     if not np.isfinite([*left_xy, initial_disparity, vertical_offset]).all():
-        return ICGNResult(status="icgn_invalid_input")
+        return ICGNResult(
+            status="icgn_diverged",
+            initial_disparity=float(initial_disparity),
+            termination_reason="icgn_diverged",
+        )
 
     radius = patch_size // 2
     if not _patch_in_bounds(left_xy, left_gray.shape, radius):
-        return ICGNResult(status="icgn_out_of_bounds")
+        return ICGNResult(
+            status="icgn_out_of_bounds",
+            initial_disparity=float(initial_disparity),
+            termination_reason="icgn_out_of_bounds",
+        )
     initial_right_xy = (left_xy[0] - initial_disparity, left_xy[1] + vertical_offset)
     if not _patch_in_bounds(initial_right_xy, right_gray.shape, radius + 2):
-        return ICGNResult(status="icgn_out_of_bounds")
+        return ICGNResult(
+            status="icgn_out_of_bounds",
+            initial_disparity=float(initial_disparity),
+            termination_reason="icgn_out_of_bounds",
+        )
 
     template = _sample_patch_cubic(left_gray, left_xy, patch_size)
     template_normalized = _normalize_patch(template, epsilon)
     if template_normalized is None:
-        return ICGNResult(status="icgn_low_gradient")
+        return ICGNResult(
+            status="icgn_low_gradient",
+            initial_disparity=float(initial_disparity),
+            termination_reason="icgn_low_gradient",
+        )
     gradient_x = cv2.Sobel(
         template_normalized,
         cv2.CV_64F,
@@ -61,35 +88,64 @@ def refine_disparity_icgn(
     ) / 8.0
     hessian = float(np.sum(gradient_x * gradient_x))
     if not np.isfinite(hessian) or hessian <= 1e-6:
-        return ICGNResult(status="icgn_low_gradient", hessian=hessian)
+        return ICGNResult(
+            status="icgn_low_gradient",
+            hessian=hessian,
+            hessian_density=hessian / float(patch_size * patch_size),
+            initial_disparity=float(initial_disparity),
+            termination_reason="icgn_low_gradient",
+        )
 
     disparity = float(initial_disparity)
-    converged = False
     residual_rms: float | None = None
     iterations = 0
     best_disparity = disparity
     best_rms = float("inf")
+    last_delta: float | None = None
+    last_update_hessian: float | None = None
+    residual_increases = 0
+    previous_rms: float | None = None
     for iterations in range(1, max_iterations + 1):
         right_xy = (left_xy[0] - disparity, left_xy[1] + vertical_offset)
         if not _patch_in_bounds(right_xy, right_gray.shape, radius + 2):
             return ICGNResult(
                 status="icgn_out_of_bounds",
+                initial_disparity=float(initial_disparity),
+                iterative_disparity=best_disparity,
+                offset_px=best_disparity - float(initial_disparity),
                 iterations=iterations - 1,
                 hessian=hessian,
+                hessian_density=(
+                    last_update_hessian / float(patch_size * patch_size)
+                    if last_update_hessian is not None
+                    else hessian / float(patch_size * patch_size)
+                ),
+                termination_reason="icgn_out_of_bounds",
             )
         warped = _sample_patch_cubic(right_gray, right_xy, patch_size)
         warped_normalized = _normalize_patch(warped, epsilon)
         if warped_normalized is None:
-            return ICGNResult(
-                status="icgn_low_gradient",
-                iterations=iterations - 1,
-                hessian=hessian,
+            return _terminated_result(
+                "icgn_low_gradient", initial_disparity, best_disparity,
+                iterations - 1, residual_rms, hessian, last_update_hessian,
+                patch_size, last_delta,
             )
         residual = warped_normalized - template_normalized
         residual_rms = float(np.sqrt(np.mean(residual * residual)))
         if residual_rms < best_rms:
             best_rms = residual_rms
             best_disparity = disparity
+        if previous_rms is not None and residual_rms > previous_rms * (1.0 + 1e-4):
+            residual_increases += 1
+        else:
+            residual_increases = 0
+        previous_rms = residual_rms
+        if residual_increases >= 3:
+            return _terminated_result(
+                "icgn_diverged", initial_disparity, best_disparity,
+                iterations, best_rms, hessian, last_update_hessian,
+                patch_size, last_delta,
+            )
         # Zero-mean normalization changes the image Jacobian.  A symmetric
         # derivative keeps the inverse-compositional update photometrically
         # invariant while the template Hessian above remains the texture gate.
@@ -111,74 +167,106 @@ def refine_disparity_icgn(
             epsilon,
         )
         if plus is None or minus is None:
-            return ICGNResult(status="icgn_low_gradient", hessian=hessian)
+            return _terminated_result(
+                "icgn_low_gradient", initial_disparity, best_disparity,
+                iterations, residual_rms, hessian, last_update_hessian,
+                patch_size, last_delta,
+            )
         normalized_jacobian = (plus - minus) / (2.0 * derivative_step)
         update_hessian = float(np.sum(normalized_jacobian * normalized_jacobian))
         if not np.isfinite(update_hessian) or update_hessian <= 1e-9:
-            return ICGNResult(status="icgn_low_gradient", hessian=hessian)
+            return _terminated_result(
+                "icgn_low_gradient", initial_disparity, best_disparity,
+                iterations, residual_rms, hessian, update_hessian,
+                patch_size, last_delta,
+            )
+        last_update_hessian = update_hessian
         delta = float(-np.sum(normalized_jacobian * residual) / update_hessian)
         if not np.isfinite(delta):
-            return ICGNResult(status="icgn_numerical_failure", iterations=iterations)
+            return _terminated_result(
+                "icgn_diverged", initial_disparity, best_disparity,
+                iterations, residual_rms, hessian, update_hessian,
+                patch_size, delta,
+            )
+        last_delta = delta
         disparity += delta
         offset = disparity - float(initial_disparity)
         if abs(offset) > max_offset:
-            return ICGNResult(
-                status="icgn_offset_exceeded",
-                offset_px=offset,
-                iterations=iterations,
-                residual_rms=residual_rms,
-                hessian=hessian,
-                cost_curvature=update_hessian / float(patch_size * patch_size),
+            return _terminated_result(
+                "icgn_diverged", initial_disparity, best_disparity,
+                iterations, residual_rms, hessian, update_hessian,
+                patch_size, delta,
             )
         if abs(delta) < epsilon:
-            converged = True
-            break
-
-    # OpenCV's cubic remap uses a finite interpolation table.  A bounded
-    # deterministic line search resolves the small limit cycle that can remain
-    # after the IC-GN updates without allowing the solution to leave the
-    # verified integer disparity basin.
-    search_center = best_disparity
-    search_low = max(float(initial_disparity) - max_offset, search_center - 0.12)
-    search_high = min(float(initial_disparity) + max_offset, search_center + 0.12)
-    search_values = np.linspace(search_low, search_high, 97)
-    search_costs: list[float] = []
-    for candidate_disparity in search_values:
-        candidate_patch = _normalize_patch(
-            _sample_patch_cubic(
-                right_gray,
-                (
-                    left_xy[0] - float(candidate_disparity),
-                    left_xy[1] + vertical_offset,
+            final_patch = _normalize_patch(
+                _sample_patch_cubic(
+                    right_gray,
+                    (left_xy[0] - disparity, left_xy[1] + vertical_offset),
+                    patch_size,
                 ),
-                patch_size,
-            ),
-            epsilon,
-        )
-        if candidate_patch is None:
-            search_costs.append(float("inf"))
-        else:
-            difference = candidate_patch - template_normalized
-            search_costs.append(float(np.mean(difference * difference)))
-    finite_costs = np.asarray(search_costs, dtype=np.float64)
-    if not np.isfinite(finite_costs).any():
-        return ICGNResult(status="icgn_numerical_failure", hessian=hessian)
-    minimum = float(np.nanmin(finite_costs))
-    tied = np.flatnonzero(np.isclose(finite_costs, minimum, rtol=1e-9, atol=1e-12))
-    best_index = int(tied[len(tied) // 2])
-    disparity = float(search_values[best_index])
-    residual_rms = float(np.sqrt(finite_costs[best_index]))
-    converged = True
-    offset = disparity - float(initial_disparity)
+                epsilon,
+            )
+            final_rms = (
+                float(np.sqrt(np.mean((final_patch - template_normalized) ** 2)))
+                if final_patch is not None
+                else float("inf")
+            )
+            if not np.isfinite(final_rms) or final_rms > max_residual:
+                return _terminated_result(
+                    "icgn_high_residual", initial_disparity, disparity,
+                    iterations, final_rms, hessian, update_hessian,
+                    patch_size, delta,
+                )
+            return ICGNResult(
+                status="icgn_converged",
+                refined_disparity=disparity,
+                offset_px=offset,
+                iterations=iterations,
+                residual_rms=final_rms,
+                hessian=hessian,
+                hessian_density=update_hessian / float(patch_size * patch_size),
+                converged=True,
+                initial_disparity=float(initial_disparity),
+                iterative_disparity=disparity,
+                final_disparity=disparity,
+                final_increment_px=delta,
+                termination_reason="icgn_converged",
+            )
+
+    return _terminated_result(
+        "icgn_max_iterations", initial_disparity, best_disparity,
+        iterations, best_rms, hessian, last_update_hessian,
+        patch_size, last_delta,
+    )
+
+
+def _terminated_result(
+    status: str,
+    initial_disparity: float,
+    iterative_disparity: float,
+    iterations: int,
+    residual_rms: float | None,
+    hessian: float,
+    update_hessian: float | None,
+    patch_size: int,
+    final_increment: float | None,
+) -> ICGNResult:
     return ICGNResult(
-        status="valid" if converged else "icgn_not_converged",
-        refined_disparity=disparity if converged else None,
-        offset_px=offset,
+        status=status,
+        offset_px=float(iterative_disparity - initial_disparity),
         iterations=iterations,
         residual_rms=residual_rms,
         hessian=hessian,
-        cost_curvature=update_hessian / float(patch_size * patch_size),
-        converged=converged,
+        hessian_density=(
+            update_hessian / float(patch_size * patch_size)
+            if update_hessian is not None and np.isfinite(update_hessian)
+            else None
+        ),
+        converged=False,
+        initial_disparity=float(initial_disparity),
+        iterative_disparity=float(iterative_disparity),
+        final_increment_px=final_increment,
+        termination_reason=status,
     )
 
 
@@ -195,19 +283,14 @@ def _sample_patch_cubic(
     center: tuple[float, float],
     patch_size: int,
 ) -> np.ndarray:
-    radius = patch_size // 2
-    offsets = np.arange(-radius, radius + 1, dtype=np.float32)
-    map_x, map_y = np.meshgrid(
-        offsets + np.float32(center[0]),
-        offsets + np.float32(center[1]),
-    )
-    return cv2.remap(
-        image.astype(np.float64, copy=False),
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_REFLECT101,
-    )
+    # getRectSubPix provides continuous bilinear coordinates.  cv2.remap's
+    # interpolation table quantizes coordinates and can create a small IC-GN
+    # limit cycle that never satisfies the requested increment tolerance.
+    return cv2.getRectSubPix(
+        image.astype(np.float32, copy=False),
+        (patch_size, patch_size),
+        (float(center[0]), float(center[1])),
+    ).astype(np.float64, copy=False)
 
 
 def _patch_in_bounds(

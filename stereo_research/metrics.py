@@ -234,24 +234,30 @@ def _research_quality_metrics(
     gt_by_key: dict[tuple[int, str], dict[str, Any]],
     gt_by_point: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    cycle_errors = [
-        value for row in rows if (value := _as_float(row.get("cycle_error_px"))) is not None
-    ]
-    cycle_failures = sum(
-        str(row.get("status")) == "cycle_failed"
-        or str(row.get("cycle_status")) == "cycle_failed"
+    cycle_unavailable = {"", "none", "not_attempted", "not_used", "not_enabled"}
+    cycle_rows = [
+        row
         for row in rows
-    )
-    cycle_recoveries = sum(
-        str(row.get("cycle_status")) == "cycle_recovered" for row in rows
-    )
-    cycle_denominator = len(cycle_errors) + cycle_failures
+        if str(row.get("cycle_status", "")).strip().lower() not in cycle_unavailable
+    ]
+    cycle_errors = [
+        value
+        for row in cycle_rows
+        if (value := _as_float(row.get("cycle_error_px"))) is not None
+    ]
+    cycle_status_counts = Counter(str(row.get("cycle_status")) for row in cycle_rows)
+    cycle_failures = cycle_status_counts["cycle_failed"]
+    cycle_recoveries = cycle_status_counts["cycle_recovered"]
     icgn_rows = [
         row
         for row in rows
         if str(row.get("icgn_status", "")) not in {"", "not_attempted"}
     ]
-    icgn_successes = sum(str(row.get("icgn_status")) == "valid" for row in icgn_rows)
+    icgn_successes = sum(
+        str(row.get("icgn_status")) in {"valid", "icgn_converged"}
+        and _as_bool(row.get("icgn_converged", True))
+        for row in icgn_rows
+    )
     icgn_iterations = [
         value
         for row in icgn_rows
@@ -262,16 +268,8 @@ def _research_quality_metrics(
         for row in icgn_rows
         if (value := _as_float(row.get("icgn_residual"))) is not None
     ]
-    measured_disparities = [
-        value
-        for row in valid_rows
-        if (value := _as_float(row.get("measured_disparity"))) is not None
-    ]
-    estimated_disparities = [
-        value
-        for row in valid_rows
-        if (value := _as_float(row.get("estimated_disparity"))) is not None
-    ]
+    measured_stds = grouped_temporal_std(valid_rows, "measured_disparity")
+    estimated_stds = grouped_temporal_std(valid_rows, "estimated_disparity")
     integer_errors: list[float] = []
     subpixel_errors: list[float] = []
     icgn_errors: list[float] = []
@@ -295,7 +293,7 @@ def _research_quality_metrics(
                 integer_errors.append(integer_value - truth_disparity)
             if subpixel_value is not None:
                 subpixel_errors.append(subpixel_value - truth_disparity)
-            if str(row.get("icgn_status")) == "valid" and subpixel_value is not None:
+            if str(row.get("icgn_status")) in {"valid", "icgn_converged"} and subpixel_value is not None:
                 icgn_errors.append(subpixel_value - truth_disparity)
             if estimated_value is not None:
                 amplitude_groups[
@@ -318,31 +316,43 @@ def _research_quality_metrics(
         if truth_amplitude > 1e-12:
             amplitude_ratios.append(0.5 * float(np.ptp(estimate)) / truth_amplitude)
 
-    compensated_valid = [
-        row for row in valid_rows if _as_bool(row.get("compensation_applied"))
+    compensation_unavailable = {"", "none", "not_enabled", "not_attempted", "not_used"}
+    compensation_rows = [
+        row
+        for row in rows
+        if str(row.get("compensation_status", "")).strip().lower()
+        not in compensation_unavailable
     ]
+    compensated_valid = [row for row in compensation_rows if _as_bool(row.get("compensation_applied"))]
     reference_residuals: list[float] = []
-    raw_static_values: list[float] = []
-    compensated_static_values: list[float] = []
     for row in valid_rows:
         if str(row.get("point_role", "measurement")) != "reference":
             continue
-        raw = _delta_vector(row, "raw_delta_")
         compensated = _delta_vector(row, "compensated_delta_")
-        if raw is not None:
-            raw_static_values.append(float(np.linalg.norm(raw)))
         if compensated is not None:
             residual = float(np.linalg.norm(compensated))
-            compensated_static_values.append(residual)
             reference_residuals.append(residual)
-    raw_drifts, compensated_drifts = _camera_drift_values(valid_rows)
+    raw_static_values, compensated_static_values, raw_drifts, compensated_drifts = (
+        _static_reference_series_metrics(valid_rows)
+    )
+    measured_std_stats = _distribution_metrics(measured_stds)
+    estimated_std_stats = _distribution_metrics(estimated_stds)
+    raw_static_stats = _distribution_metrics(raw_static_values)
+    compensated_static_stats = _distribution_metrics(compensated_static_values)
+    raw_drift_stats = _distribution_metrics(raw_drifts)
+    compensated_drift_stats = _distribution_metrics(compensated_drifts)
     return {
         "cycle_sample_count": len(cycle_errors),
+        "cycle_attempt_count": len(cycle_rows),
+        "cycle_valid_count": cycle_status_counts["cycle_valid"],
+        "cycle_soft_count": cycle_status_counts["cycle_soft"],
+        "cycle_recovery_required_count": cycle_status_counts["cycle_recovery_required"],
+        "cycle_recovered_count": cycle_recoveries,
         "cycle_error_mean_px": float(np.mean(cycle_errors)) if cycle_errors else None,
         "cycle_error_median_px": float(np.median(cycle_errors)) if cycle_errors else None,
         "cycle_error_p95_px": float(np.percentile(cycle_errors, 95)) if cycle_errors else None,
         "cycle_failure_count": cycle_failures,
-        "cycle_failure_rate_pct": _percent(cycle_failures, cycle_denominator),
+        "cycle_failure_rate_pct": _percent(cycle_failures, len(cycle_rows)),
         "cycle_recovery_count": cycle_recoveries,
         "icgn_attempt_count": len(icgn_rows),
         "icgn_success_count": icgn_successes,
@@ -352,20 +362,71 @@ def _research_quality_metrics(
         "integer_disparity_rmse_px": _rmse(integer_errors),
         "subpixel_disparity_rmse_px": _rmse(subpixel_errors),
         "icgn_disparity_rmse_px": _rmse(icgn_errors),
-        "measured_disparity_std_px": float(np.std(measured_disparities)) if measured_disparities else None,
-        "estimated_disparity_std_px": float(np.std(estimated_disparities)) if estimated_disparities else None,
+        "measured_disparity_std_px": measured_std_stats["mean"],
+        "estimated_disparity_std_px": estimated_std_stats["mean"],
+        "measured_disparity_temporal_std_mean_px": measured_std_stats["mean"],
+        "measured_disparity_temporal_std_median_px": measured_std_stats["median"],
+        "measured_disparity_temporal_std_p95_px": measured_std_stats["p95"],
+        "estimated_disparity_temporal_std_mean_px": estimated_std_stats["mean"],
+        "estimated_disparity_temporal_std_median_px": estimated_std_stats["median"],
+        "estimated_disparity_temporal_std_p95_px": estimated_std_stats["p95"],
         "measured_xyz_rmse_mm": _rmse(measured_xyz_errors),
         "estimated_xyz_rmse_mm": _rmse(estimated_xyz_errors),
         "measured_innovation_rmse_mm": _series_innovation_rmse(valid_rows, "measured_"),
         "estimated_innovation_rmse_mm": _series_innovation_rmse(valid_rows, "estimated_"),
         "amplitude_ratio": float(np.mean(amplitude_ratios)) if amplitude_ratios else None,
-        "camera_compensation_success_rate_pct": _percent(len(compensated_valid), len(valid_rows)),
+        "camera_compensation_attempt_count": len(compensation_rows),
+        "camera_compensation_available": bool(compensation_rows),
+        "camera_compensation_success_rate_pct": _percent(len(compensated_valid), len(compensation_rows)),
         "camera_reference_residual_mean_mm": float(np.mean(reference_residuals)) if reference_residuals else None,
         "camera_reference_residual_p95_mm": float(np.percentile(reference_residuals, 95)) if reference_residuals else None,
-        "raw_static_point_std_mm": float(np.std(raw_static_values)) if raw_static_values else None,
-        "compensated_static_point_std_mm": float(np.std(compensated_static_values)) if compensated_static_values else None,
-        "raw_drift_mm": float(np.mean(raw_drifts)) if raw_drifts else None,
-        "compensated_drift_mm": float(np.mean(compensated_drifts)) if compensated_drifts else None,
+        "raw_static_point_std_mm": raw_static_stats["mean"],
+        "compensated_static_point_std_mm": compensated_static_stats["mean"],
+        "raw_static_point_std_mean_mm": raw_static_stats["mean"],
+        "raw_static_point_std_median_mm": raw_static_stats["median"],
+        "raw_static_point_std_p95_mm": raw_static_stats["p95"],
+        "compensated_static_point_std_mean_mm": compensated_static_stats["mean"],
+        "compensated_static_point_std_median_mm": compensated_static_stats["median"],
+        "compensated_static_point_std_p95_mm": compensated_static_stats["p95"],
+        "raw_drift_mm": raw_drift_stats["mean"],
+        "compensated_drift_mm": compensated_drift_stats["mean"],
+        "raw_static_drift_mean_mm": raw_drift_stats["mean"],
+        "raw_static_drift_median_mm": raw_drift_stats["median"],
+        "raw_static_drift_p95_mm": raw_drift_stats["p95"],
+        "compensated_static_drift_mean_mm": compensated_drift_stats["mean"],
+        "compensated_static_drift_median_mm": compensated_drift_stats["median"],
+        "compensated_static_drift_p95_mm": compensated_drift_stats["p95"],
+    }
+
+
+def grouped_temporal_std(
+    rows: Iterable[dict[str, Any]],
+    field: str,
+    valid_only: bool = True,
+) -> list[float]:
+    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for row in rows:
+        if valid_only and str(row.get("status")) != "valid":
+            continue
+        value = _as_float(row.get(field))
+        if value is None:
+            continue
+        grouped[(str(row.get("repeat", "0")), str(row.get("point_id")))].append(value)
+    return [
+        float(np.std(grouped[key]))
+        for key in sorted(grouped)
+        if len(grouped[key]) >= 2
+    ]
+
+
+def _distribution_metrics(values: Sequence[float]) -> dict[str, float | None]:
+    if not values:
+        return {"mean": None, "median": None, "p95": None}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(array)),
+        "median": float(np.median(array)),
+        "p95": float(np.percentile(array, 95)),
     }
 
 
@@ -406,23 +467,41 @@ def _series_innovation_rmse(rows: list[dict[str, Any]], prefix: str) -> float | 
     return _rmse(residuals)
 
 
-def _camera_drift_values(rows: list[dict[str, Any]]) -> tuple[list[float], list[float]]:
+def _static_reference_series_metrics(
+    rows: list[dict[str, Any]],
+) -> tuple[list[float], list[float], list[float], list[float]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if str(row.get("point_role", "measurement")) == "reference":
             grouped[(str(row.get("repeat", "0")), str(row.get("point_id")))].append(row)
-    raw: list[float] = []
-    compensated: list[float] = []
+    raw_volatility: list[float] = []
+    compensated_volatility: list[float] = []
+    raw_drift: list[float] = []
+    compensated_drift: list[float] = []
     for values in grouped.values():
         values.sort(key=lambda row: _as_int(row.get("frame")))
         if len(values) < 2:
             continue
-        for prefix, target in (("raw_delta_", raw), ("compensated_delta_", compensated)):
-            first = _delta_vector(values[0], prefix)
-            last = _delta_vector(values[-1], prefix)
-            if first is not None and last is not None:
-                target.append(float(np.linalg.norm(last - first)))
-    return raw, compensated
+        raw_xyz: list[np.ndarray | None] = []
+        for row in values:
+            point = _xyz_from_prefix(row, "estimated_")
+            raw_xyz.append(point if point is not None else _xyz(row))
+        compensated_xyz = [_xyz_from_prefix(row, "compensated_") for row in values]
+        for series, volatility_target, drift_target in (
+            (raw_xyz, raw_volatility, raw_drift),
+            (compensated_xyz, compensated_volatility, compensated_drift),
+        ):
+            finite = [point for point in series if point is not None]
+            if len(finite) < 2:
+                continue
+            array = np.vstack(finite)
+            center = np.mean(array, axis=0)
+            residual_norm = np.linalg.norm(array - center, axis=1)
+            volatility_target.append(
+                float(np.sqrt(np.mean(residual_norm**2)) * 1000.0)
+            )
+            drift_target.append(float(np.linalg.norm(array[-1] - array[0]) * 1000.0))
+    return raw_volatility, compensated_volatility, raw_drift, compensated_drift
 
 
 def _relative_displacement_metrics(

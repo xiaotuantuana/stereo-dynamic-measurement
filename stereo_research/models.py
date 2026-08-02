@@ -159,7 +159,12 @@ class MatcherConfig:
     icgn_max_offset_px: float = 1.5
     icgn_min_hessian: float = 1e-6
     icgn_max_residual: float = 0.35
-    icgn_fallback_method: str = "parabolic"
+    icgn_fallback_method: str = "line_search"
+    icgn_fallback_search_radius_px: float = 0.6
+    icgn_fallback_sample_count: int = 13
+    curvature_sample_step_px: float = 0.10
+    curvature_min_value: float = 1e-6
+    curvature_max_value: float = 1e4
     uncertainty_texture_reference: float = 10.0
     uncertainty_margin_reference: float = 0.10
     uncertainty_max_component: float = 3.0
@@ -176,6 +181,9 @@ class MatcherConfig:
     uncertainty_weight_lr: float = 1.0
     uncertainty_weight_cycle: float = 1.2
     uncertainty_weight_icgn: float = 0.8
+    uncertainty_weight_icgn_hessian: float = 0.4
+    uncertainty_weight_curvature: float = 0.4
+    uncertainty_curvature_reference: float = 0.1
     enable_adaptive_filter: bool = True
     kalman_process_position_variance: float = 0.01
     kalman_process_velocity_variance: float = 0.0025
@@ -263,8 +271,18 @@ class MatcherConfig:
             raise ValueError("IC-GN epsilon and maximum offset must be positive")
         if self.icgn_min_hessian <= 0 or self.icgn_max_residual <= 0:
             raise ValueError("IC-GN Hessian and residual limits must be positive")
-        if self.icgn_fallback_method not in {"continuous", "parabolic", "integer"}:
-            raise ValueError("icgn fallback must be continuous, parabolic, or integer")
+        if self.icgn_fallback_method not in {"line_search", "continuous", "parabolic", "integer"}:
+            raise ValueError("icgn fallback must be line_search, continuous, parabolic, or integer")
+        if self.icgn_fallback_search_radius_px <= 0:
+            raise ValueError("IC-GN fallback search radius must be positive")
+        if self.icgn_fallback_sample_count < 5 or self.icgn_fallback_sample_count % 2 == 0:
+            raise ValueError("IC-GN fallback sample count must be odd and at least 5")
+        if (
+            self.curvature_sample_step_px <= 0
+            or self.curvature_min_value <= 0
+            or self.curvature_max_value < self.curvature_min_value
+        ):
+            raise ValueError("curvature controls must be positive and ordered")
         positive_uncertainty = (
             self.uncertainty_texture_reference,
             self.uncertainty_margin_reference,
@@ -275,6 +293,7 @@ class MatcherConfig:
             self.uncertainty_base_left_variance_px2,
             self.uncertainty_min_left_variance_px2,
             self.uncertainty_max_left_variance_px2,
+            self.uncertainty_curvature_reference,
         )
         if any(value <= 0 for value in positive_uncertainty):
             raise ValueError("uncertainty references and variance bounds must be positive")
@@ -295,6 +314,8 @@ class MatcherConfig:
             self.uncertainty_weight_lr,
             self.uncertainty_weight_cycle,
             self.uncertainty_weight_icgn,
+            self.uncertainty_weight_icgn_hessian,
+            self.uncertainty_weight_curvature,
         )
         if any(weight < 0 for weight in uncertainty_weights):
             raise ValueError("uncertainty weights must be non-negative")
@@ -404,9 +425,16 @@ class PointState:
     right_xy: tuple[float, float] | None = None
     previous_right_xy: tuple[float, float] | None = None
     right_flow_reference_xy: tuple[float, float] | None = None
+    right_flow_reference_frame: int | None = None
     point_role: Literal["measurement", "reference"] = "measurement"
     disparity_history: list[float] = field(default_factory=list)
     estimated_disparity_history: list[float] = field(default_factory=list)
+    latest_disparity: float | None = None
+    last_accepted_measured_right_xy: tuple[float, float] | None = None
+    last_accepted_measured_disparity: float | None = None
+    last_estimated_left_xy: tuple[float, float] | None = None
+    last_estimated_right_xy: tuple[float, float] | None = None
+    last_estimated_disparity: float | None = None
     xyz: tuple[float, float, float] | None = None
     estimated_xyz: tuple[float, float, float] | None = None
     reference_xyz: tuple[float, float, float] | None = None
@@ -490,7 +518,6 @@ class PointState:
     ) -> None:
         self.previous_right_xy = self.right_xy
         self.right_xy = right_xy
-        self.right_flow_reference_xy = right_xy
         self.disparity_history.append(float(disparity))
         if len(self.disparity_history) > 2:
             self.disparity_history = self.disparity_history[-2:]
@@ -500,6 +527,18 @@ class PointState:
             self.estimated_disparity_history = self.estimated_disparity_history[-2:]
         self.xyz = xyz
         self.estimated_xyz = estimated_xyz if estimated_xyz is not None else xyz
+        self.latest_disparity = float(disparity)
+        self.last_accepted_measured_right_xy = (
+            float(right_xy[0]),
+            float(right_xy[1]),
+        )
+        self.last_accepted_measured_disparity = float(disparity)
+        self.last_estimated_left_xy = self.left_xy
+        self.last_estimated_right_xy = (
+            float(self.left_xy[0] - estimate),
+            float(right_xy[1]),
+        )
+        self.last_estimated_disparity = estimate
         if self.reference_xyz is None and xyz is not None:
             self.reference_xyz = xyz
         if self.reference_measured_xyz is None and xyz is not None:
@@ -507,6 +546,45 @@ class PointState:
         if self.reference_estimated_xyz is None and self.estimated_xyz is not None:
             self.reference_estimated_xyz = self.estimated_xyz
         self.confidence = float(confidence)
+
+    @property
+    def measured_disparity_history(self) -> list[float]:
+        """Accepted raw measurements; rejected measurements are never appended."""
+        return self.disparity_history
+
+    def record_estimated_only(
+        self,
+        estimated_left_xy: tuple[float, float],
+        estimated_right_xy: tuple[float, float],
+        estimated_disparity: float,
+        estimated_xyz_m: tuple[float, float, float],
+        frame: int,
+        quality_stage: str,
+    ) -> None:
+        """Advance tracking from a filter prediction without accepting raw measurement data."""
+        del frame, quality_stage  # retained in the API for traceability at the call site
+        self.left_xy = (float(estimated_left_xy[0]), float(estimated_left_xy[1]))
+        self.previous_right_xy = self.right_xy
+        self.right_xy = (float(estimated_right_xy[0]), float(estimated_right_xy[1]))
+        estimate = float(estimated_disparity)
+        self.estimated_disparity_history.append(estimate)
+        if len(self.estimated_disparity_history) > 2:
+            self.estimated_disparity_history = self.estimated_disparity_history[-2:]
+        self.latest_disparity = estimate
+        self.last_estimated_left_xy = self.left_xy
+        self.last_estimated_right_xy = self.right_xy
+        self.last_estimated_disparity = estimate
+        self.estimated_xyz = tuple(float(value) for value in estimated_xyz_m)
+        if self.reference_estimated_xyz is None:
+            self.reference_estimated_xyz = self.estimated_xyz
+
+    def set_right_flow_reference(
+        self,
+        frame: int,
+        xy: tuple[float, float],
+    ) -> None:
+        self.right_flow_reference_frame = int(frame)
+        self.right_flow_reference_xy = (float(xy[0]), float(xy[1]))
 
     def confirm_valid(self, confidence: float) -> None:
         self.confidence = float(confidence)
@@ -588,6 +666,15 @@ class FramePointResult:
     icgn_residual: float | None = None
     icgn_hessian: float | None = None
     icgn_cost_curvature: float | None = None
+    icgn_hessian_density: float | None = None
+    zncc_cost_curvature: float | None = None
+    curvature_sample_step_px: float | None = None
+    icgn_termination_reason: str = ""
+    icgn_fallback_used: bool = False
+    icgn_fallback_method: str = "none"
+    icgn_iterative_disparity: float | None = None
+    icgn_final_increment_px: float | None = None
+    subpixel_final_status: str = "not_attempted"
     left_variance_px2: float | None = None
     disparity_variance_px2: float | None = None
     measurement_quality_score: float | None = None
@@ -598,6 +685,12 @@ class FramePointResult:
     kalman_gain_disparity: float | None = None
     kalman_nis: float | None = None
     kalman_update_status: str = "not_used"
+    kalman_predict_only_frames: int = 0
+    measurement_accepted_for_state: bool = True
+    state_update_source: str = "measured"
+    right_flow_reference_frame: int | None = None
+    right_reference_source: str = "not_enabled"
+    right_reference_age_frames: int | None = None
     point_role: str = "measurement"
     compensation_status: str = "not_used"
     compensation_applied: bool = False
@@ -730,6 +823,15 @@ class FramePointResult:
             "icgn_residual": self.icgn_residual,
             "icgn_hessian": self.icgn_hessian,
             "icgn_cost_curvature": self.icgn_cost_curvature,
+            "icgn_hessian_density": self.icgn_hessian_density,
+            "zncc_cost_curvature": self.zncc_cost_curvature,
+            "curvature_sample_step_px": self.curvature_sample_step_px,
+            "icgn_termination_reason": self.icgn_termination_reason,
+            "icgn_fallback_used": self.icgn_fallback_used,
+            "icgn_fallback_method": self.icgn_fallback_method,
+            "icgn_iterative_disparity": self.icgn_iterative_disparity,
+            "icgn_final_increment_px": self.icgn_final_increment_px,
+            "subpixel_final_status": self.subpixel_final_status,
             "left_variance_px2": self.left_variance_px2,
             "disparity_variance_px2": self.disparity_variance_px2,
             "measurement_quality_score": self.measurement_quality_score,
@@ -740,6 +842,12 @@ class FramePointResult:
             "kalman_gain_disparity": self.kalman_gain_disparity,
             "kalman_nis": self.kalman_nis,
             "kalman_update_status": self.kalman_update_status,
+            "kalman_predict_only_frames": self.kalman_predict_only_frames,
+            "measurement_accepted_for_state": self.measurement_accepted_for_state,
+            "state_update_source": self.state_update_source,
+            "right_flow_reference_frame": self.right_flow_reference_frame,
+            "right_reference_source": self.right_reference_source,
+            "right_reference_age_frames": self.right_reference_age_frames,
             "point_role": self.point_role,
             "compensation_status": self.compensation_status,
             "compensation_applied": self.compensation_applied,

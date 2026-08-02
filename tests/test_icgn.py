@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from stereo_research.icgn import refine_disparity_icgn
-from stereo_research.local_matching import LocalMatcher
+from stereo_research.local_matching import LocalMatcher, sanitize_cost_curvature
 from stereo_research.models import MatcherConfig, method_profile
 
 
@@ -45,7 +45,7 @@ def test_icgn_recovers_noise_free_fractional_disparity(fraction: float) -> None:
         max_offset=1.5,
     )
 
-    assert result.status == "valid"
+    assert result.status == "icgn_converged"
     assert result.converged is True
     assert result.refined_disparity is not None
     assert abs(result.refined_disparity - true_disparity) < 0.02
@@ -73,7 +73,7 @@ def test_icgn_is_robust_to_noise_and_brightness_offset() -> None:
         max_offset=1.5,
     )
 
-    assert result.status == "valid"
+    assert result.status == "icgn_converged"
     assert result.refined_disparity is not None
     assert abs(result.refined_disparity - true_disparity) < 0.05
 
@@ -137,7 +137,7 @@ def test_research_matcher_uses_icgn_and_exports_quality() -> None:
     )
 
     assert result.status == "valid"
-    assert result.icgn_status == "valid"
+    assert result.icgn_status == "icgn_converged"
     assert result.icgn_converged is True
     assert result.icgn_iterations > 0
     assert result.icgn_residual is not None
@@ -167,6 +167,113 @@ def test_matcher_reports_icgn_quality_rejection_and_falls_back() -> None:
     )
 
     assert result.status == "valid"
-    assert result.icgn_converged is True
-    assert result.icgn_status == "icgn_residual_exceeded"
+    assert result.icgn_converged is False
+    assert result.icgn_status == "icgn_high_residual"
+    assert result.icgn_fallback_used is True
+    assert result.icgn_fallback_method == "parabolic"
+    assert result.subpixel_final_status == "parabolic_fallback"
     assert result.quality_stage.endswith("_icgn_fallback_parabolic")
+
+
+def test_icgn_max_iteration_is_not_reported_as_converged() -> None:
+    left = _textured_image()
+    right = _right_from_disparity(left, 8.65)
+
+    result = refine_disparity_icgn(
+        left,
+        right,
+        left_xy=(150.0, 75.0),
+        initial_disparity=9.0,
+        vertical_offset=0.0,
+        patch_size=31,
+        max_iterations=1,
+        epsilon=1e-12,
+        max_offset=1.5,
+    )
+
+    assert result.status == "icgn_max_iterations"
+    assert result.termination_reason == "icgn_max_iterations"
+    assert result.converged is False
+    assert result.iterative_disparity is not None
+    assert result.fallback_used is False
+
+
+def test_icgn_wrong_initial_value_cannot_fake_convergence() -> None:
+    left = _textured_image()
+    right = _right_from_disparity(left, 8.65)
+
+    result = refine_disparity_icgn(
+        left,
+        right,
+        left_xy=(150.0, 75.0),
+        initial_disparity=13.0,
+        vertical_offset=0.0,
+        patch_size=31,
+        max_iterations=20,
+        epsilon=1e-4,
+        max_offset=1.0,
+    )
+
+    assert result.converged is False
+    assert result.status in {"icgn_diverged", "icgn_max_iterations", "icgn_high_residual"}
+
+
+def test_line_search_fallback_does_not_fake_icgn_convergence() -> None:
+    left = _textured_image()
+    true_disparity = 8.65
+    right = _right_from_disparity(left, true_disparity)
+    matcher = LocalMatcher(
+        MatcherConfig(
+            uniqueness_margin=0.005,
+            icgn_patch_size=31,
+            icgn_max_iterations=1,
+            icgn_epsilon=1e-12,
+            icgn_fallback_method="line_search",
+        )
+    )
+
+    result = matcher.match(
+        left,
+        right,
+        left_xy=(150.0, 75.0),
+        predicted_disparity=9.0,
+        profile=method_profile("research_full"),
+    )
+
+    assert result.status == "valid"
+    assert result.icgn_status == "icgn_max_iterations"
+    assert result.icgn_converged is False
+    assert result.icgn_fallback_used is True
+    assert result.icgn_fallback_method == "line_search"
+    assert result.subpixel_final_status == "line_search_refined"
+    assert result.disparity is not None
+    assert abs(result.disparity - true_disparity) < 0.08
+
+
+def test_true_zncc_curvature_is_higher_for_rich_texture_than_blurred_texture() -> None:
+    rich_left = _textured_image()
+    blurred_left = cv2.GaussianBlur(rich_left, (31, 31), 8.0)
+    rich_right = _right_from_disparity(rich_left, 8.5)
+    blurred_right = _right_from_disparity(blurred_left, 8.5)
+    matcher = LocalMatcher(MatcherConfig(curvature_sample_step_px=0.1))
+
+    rich_patch = matcher._extract_patch(rich_left, (150.0, 75.0))
+    blurred_patch = matcher._extract_patch(blurred_left, (150.0, 75.0))
+    assert rich_patch is not None and blurred_patch is not None
+    rich_curvature = matcher._zncc_cost_curvature(
+        rich_patch, rich_right, (150.0, 75.0), 8.5, 0,
+    )
+    blurred_curvature = matcher._zncc_cost_curvature(
+        blurred_patch, blurred_right, (150.0, 75.0), 8.5, 0,
+    )
+
+    assert rich_curvature is not None and blurred_curvature is not None
+    assert rich_curvature > blurred_curvature
+
+
+def test_cost_curvature_sanitizes_nonfinite_negative_and_extreme_values() -> None:
+    config = MatcherConfig(curvature_min_value=1e-5, curvature_max_value=100.0)
+
+    assert sanitize_cost_curvature(float("nan"), config) is None
+    assert sanitize_cost_curvature(-3.0, config) == config.curvature_min_value
+    assert sanitize_cost_curvature(1e8, config) == config.curvature_max_value

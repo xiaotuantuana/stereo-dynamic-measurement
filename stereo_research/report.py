@@ -268,6 +268,23 @@ def _write_plots(
     _bar_plot(plt, save, summaries, "coverage_pct", "Coverage (%)", "coverage_comparison", colors)
     _bar_plot(plt, save, summaries, "false_match_rate_pct", "False matches (%)", "false_match_comparison", colors)
     _bar_plot(plt, save, summaries, "recovery_success_rate_pct", "Recovery success (%)", "recovery_comparison", colors)
+    _bar_plot(
+        plt, save, summaries,
+        "cycle_failure_rate_pct", "Cycle failures (%)", "cycle_failure_rate", colors,
+        title="Cycle failure rate (attempted methods only)",
+    )
+    _bar_plot(
+        plt, save, summaries,
+        "camera_compensation_success_rate_pct", "Compensation success (%)",
+        "camera_compensation_success_rate", colors,
+        title="Camera compensation success (attempted methods only)",
+    )
+    _bar_plot(
+        plt, save, summaries,
+        "measured_disparity_temporal_std_mean_px", "Temporal std (px)",
+        "measured_disparity_temporal_std", colors,
+        title="Measured disparity per-point temporal standard deviation",
+    )
 
     for field, ylabel, title, filename in (
         ("cycle_error_px", "Cycle error (px)", "Four-view cycle consistency", "cycle_error_over_time"),
@@ -335,10 +352,11 @@ def _write_plots(
         raw = [_float_or_none(row.get("raw_delta_Z_mm")) for row in valid]
         compensated = [_float_or_none(row.get("compensated_delta_Z_mm")) for row in valid]
         color = colors[method_index % len(colors)]
-        if frames and all(value is not None for value in raw):
+        has_compensated = frames and all(value is not None for value in compensated)
+        if has_compensated and all(value is not None for value in raw):
             axis.plot(frames, raw, color=color, alpha=0.4, label=f"{method} raw")
             plotted = True
-        if frames and all(value is not None for value in compensated):
+        if has_compensated:
             axis.plot(frames, compensated, color=color, linestyle="--", label=f"{method} compensated")
             plotted = True
     axis.set_xlabel("Frame")
@@ -389,7 +407,7 @@ def _write_plots(
     width = 0.24
     for metric_index, (metric, label) in enumerate(metric_specs):
         values = [summaries[method].get(metric) for method in method_names]
-        numeric = [0.0 if value is None else float(value) for value in values]
+        numeric = [np.nan if value is None else float(value) for value in values]
         axis.bar(
             x_positions + (metric_index - 1) * width,
             numeric,
@@ -507,16 +525,24 @@ def _bar_plot(
     ylabel: str,
     name: str,
     colors: list[str],
+    title: str | None = None,
 ) -> None:
     figure, axis = plt.subplots(figsize=(6.75, 2.8))
-    methods = list(summaries)
-    values = [summaries[method].get(metric) for method in methods]
-    numeric = [0.0 if value is None else float(value) for value in values]
+    available = [
+        (method, summaries[method].get(metric))
+        for method in summaries
+        if summaries[method].get(metric) is not None
+    ]
+    methods = [item[0] for item in available]
+    values = [item[1] for item in available]
+    numeric = [float(value) for value in values]
     bars = axis.bar(methods, numeric, color=[colors[index % len(colors)] for index in range(len(methods))])
     for bar, value in zip(bars, values):
         label = "N/A" if value is None else f"{float(value):.1f}"
         axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), label, ha="center", va="bottom", fontsize=7)
     axis.set_ylabel(ylabel)
-    axis.set_title(ylabel)
+    axis.set_title(title or ylabel)
+    if not available:
+        axis.text(0.5, 0.5, "Unavailable", ha="center", va="center", transform=axis.transAxes)
     axis.tick_params(axis="x", rotation=20)
     save(figure, name)

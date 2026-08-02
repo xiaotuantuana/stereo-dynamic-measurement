@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import math
 
-from stereo_research.metrics import evaluate_rows, frame_runtime_values, paired_bootstrap_ci
+from stereo_research.metrics import (
+    evaluate_rows,
+    frame_runtime_values,
+    grouped_temporal_std,
+    paired_bootstrap_ci,
+)
 
 
 def _prediction(
@@ -328,6 +333,7 @@ def test_research_quality_metrics_are_reported_from_raw_fields() -> None:
                 "measured_disparity": measured,
                 "estimated_disparity": estimated,
                 "compensation_applied": applied,
+                "compensation_status": "valid" if applied else "ransac_failed",
                 "point_role": "reference",
                 "raw_delta_X_mm": float(frame * 2),
                 "compensated_delta_X_mm": float(frame) if applied else "",
@@ -339,7 +345,11 @@ def test_research_quality_metrics_are_reported_from_raw_fields() -> None:
     summary = evaluate_rows(rows)
 
     assert summary["cycle_sample_count"] == 3
+    assert summary["cycle_attempt_count"] == 4
+    assert summary["cycle_valid_count"] == 1
+    assert summary["cycle_soft_count"] == 1
     assert summary["cycle_failure_count"] == 1
+    assert summary["cycle_failure_rate_pct"] == 25.0
     assert summary["cycle_recovery_count"] == 1
     assert summary["cycle_error_median_px"] == 0.8
     assert summary["icgn_attempt_count"] == 3
@@ -347,3 +357,72 @@ def test_research_quality_metrics_are_reported_from_raw_fields() -> None:
     assert math.isclose(summary["icgn_success_rate_pct"], 200.0 / 3.0)
     assert summary["measured_disparity_std_px"] > summary["estimated_disparity_std_px"]
     assert math.isclose(summary["camera_compensation_success_rate_pct"], 200.0 / 3.0)
+
+
+def test_cycle_failure_denominator_does_not_double_count_error_row() -> None:
+    rows = [
+        {**_prediction(0), "cycle_status": "cycle_valid", "cycle_error_px": 0.2},
+        {**_prediction(1), "cycle_status": "cycle_failed", "cycle_error_px": 2.5},
+    ]
+
+    summary = evaluate_rows(rows)
+
+    assert summary["cycle_attempt_count"] == 2
+    assert summary["cycle_failure_count"] == 1
+    assert summary["cycle_failure_rate_pct"] == 50.0
+
+
+def test_unavailable_compensation_is_none_not_zero() -> None:
+    rows = [
+        {**_prediction(0), "compensation_status": "not_enabled"},
+        {**_prediction(1), "compensation_status": "not_attempted"},
+    ]
+
+    summary = evaluate_rows(rows)
+
+    assert summary["camera_compensation_available"] is False
+    assert summary["camera_compensation_attempt_count"] == 0
+    assert summary["camera_compensation_success_rate_pct"] is None
+
+
+def test_disparity_temporal_std_is_grouped_by_repeat_and_point() -> None:
+    rows = []
+    for point_id, disparity in (("P1", 8.0), ("P2", 20.0)):
+        for frame in range(3):
+            row = _prediction(frame)
+            row.update(
+                point_id=point_id,
+                measured_disparity=disparity,
+                estimated_disparity=disparity,
+            )
+            rows.append(row)
+
+    assert grouped_temporal_std(rows, "measured_disparity") == [0.0, 0.0]
+    summary = evaluate_rows(rows)
+    assert summary["measured_disparity_std_px"] == 0.0
+    assert summary["measured_disparity_temporal_std_p95_px"] == 0.0
+
+
+def test_static_reference_volatility_and_drift_are_per_point_xyz_series() -> None:
+    rows = []
+    for point_id, base_x in (("R1", 0.0), ("R2", 1.0)):
+        for frame in range(3):
+            row = _prediction(frame, x_m=base_x)
+            row.update(
+                point_id=point_id,
+                point_role="reference",
+                estimated_X_m=base_x,
+                estimated_Y_m=0.0,
+                estimated_Z_m=2.0,
+                compensated_X_m=base_x,
+                compensated_Y_m=0.0,
+                compensated_Z_m=2.0,
+            )
+            rows.append(row)
+
+    summary = evaluate_rows(rows)
+
+    assert summary["raw_static_point_std_mm"] == 0.0
+    assert summary["compensated_static_point_std_mm"] == 0.0
+    assert summary["raw_drift_mm"] == 0.0
+    assert summary["compensated_drift_mm"] == 0.0

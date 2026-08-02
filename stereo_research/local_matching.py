@@ -9,6 +9,19 @@ from .icgn import ICGNResult, refine_disparity_icgn
 from .models import MatcherConfig, MethodProfile
 
 
+def sanitize_cost_curvature(
+    curvature: float,
+    config: MatcherConfig,
+) -> float | None:
+    if not np.isfinite(curvature):
+        return None
+    if curvature <= 0:
+        return float(config.curvature_min_value)
+    return float(
+        np.clip(curvature, config.curvature_min_value, config.curvature_max_value)
+    )
+
+
 @dataclass(frozen=True)
 class LocalMatchResult:
     status: str
@@ -40,6 +53,15 @@ class LocalMatchResult:
     icgn_residual: float | None = None
     icgn_hessian: float | None = None
     icgn_cost_curvature: float | None = None
+    icgn_hessian_density: float | None = None
+    icgn_termination_reason: str = ""
+    icgn_fallback_used: bool = False
+    icgn_fallback_method: str = "none"
+    icgn_iterative_disparity: float | None = None
+    icgn_final_increment_px: float | None = None
+    subpixel_final_status: str = "not_attempted"
+    zncc_cost_curvature: float | None = None
+    curvature_sample_step_px: float | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +225,9 @@ class LocalMatcher:
         disparity = float(best.disparity)
         icgn_result: ICGNResult | None = None
         icgn_output_status = "not_attempted"
+        icgn_fallback_used = False
+        icgn_fallback_method = "none"
+        subpixel_final_status = "not_attempted"
         quality_stage = "primary"
         if profile.use_subpixel and self.config.enable_subpixel:
             subpixel_method = (
@@ -221,30 +246,36 @@ class LocalMatcher:
                     self.config.icgn_max_iterations,
                     self.config.icgn_epsilon,
                     self.config.icgn_max_offset_px,
+                    self.config.icgn_max_residual,
                 )
                 icgn_output_status = icgn_result.status
-                if (
-                    icgn_result.status == "valid"
-                    and icgn_result.hessian is not None
-                    and icgn_result.hessian < self.config.icgn_min_hessian
-                ):
+                if icgn_result.hessian is not None and icgn_result.hessian < self.config.icgn_min_hessian:
                     icgn_output_status = "icgn_low_hessian"
-                elif (
-                    icgn_result.status == "valid"
-                    and icgn_result.residual_rms is not None
-                    and icgn_result.residual_rms > self.config.icgn_max_residual
-                ):
-                    icgn_output_status = "icgn_residual_exceeded"
                 if (
-                    icgn_output_status == "valid"
+                    icgn_output_status == "icgn_converged"
+                    and icgn_result.converged
                     and icgn_result.refined_disparity is not None
-                    and icgn_result.hessian is not None
-                    and icgn_result.hessian >= self.config.icgn_min_hessian
-                    and icgn_result.residual_rms is not None
-                    and icgn_result.residual_rms <= self.config.icgn_max_residual
                 ):
                     disparity = float(icgn_result.refined_disparity)
                     quality_stage += "_icgn"
+                    subpixel_final_status = "icgn_converged"
+                elif self.config.icgn_fallback_method == "line_search":
+                    center = (
+                        icgn_result.iterative_disparity
+                        if icgn_result.iterative_disparity is not None
+                        else float(best.disparity)
+                    )
+                    disparity = self._line_search_refine(
+                        left_patch,
+                        right_gray,
+                        left_xy,
+                        center,
+                        best.vertical_offset,
+                    )
+                    icgn_fallback_used = True
+                    icgn_fallback_method = "line_search"
+                    subpixel_final_status = "line_search_refined"
+                    quality_stage += "_icgn_fallback_line_search"
                 elif self.config.icgn_fallback_method != "integer":
                     disparity += self._subpixel_offset(
                         left_patch,
@@ -254,8 +285,18 @@ class LocalMatcher:
                         best.vertical_offset,
                         method=self.config.icgn_fallback_method,
                     )
+                    icgn_fallback_used = True
+                    icgn_fallback_method = self.config.icgn_fallback_method
+                    subpixel_final_status = (
+                        "parabolic_fallback"
+                        if self.config.icgn_fallback_method == "parabolic"
+                        else "line_search_refined"
+                    )
                     quality_stage += f"_icgn_fallback_{self.config.icgn_fallback_method}"
                 else:
+                    icgn_fallback_used = True
+                    icgn_fallback_method = "integer"
+                    subpixel_final_status = "integer_fallback"
                     quality_stage += "_icgn_fallback_integer"
             else:
                 disparity += self._subpixel_offset(
@@ -266,9 +307,21 @@ class LocalMatcher:
                     best.vertical_offset,
                     method=subpixel_method,
                 )
+                subpixel_final_status = f"{subpixel_method}_refined"
         right_xy = (
             float(left_xy[0] - disparity),
             float(left_xy[1] + best.vertical_offset),
+        )
+        zncc_cost_curvature = (
+            self._zncc_cost_curvature(
+                left_patch,
+                right_gray,
+                left_xy,
+                disparity,
+                best.vertical_offset,
+            )
+            if profile.use_icgn
+            else None
         )
         cycle_error = (
             float(np.linalg.norm(np.asarray(right_xy) - np.asarray(temporal_right_xy)))
@@ -307,7 +360,21 @@ class LocalMatcher:
                     icgn_iterations=(icgn_result.iterations if icgn_result else 0),
                     icgn_residual=(icgn_result.residual_rms if icgn_result else None),
                     icgn_hessian=(icgn_result.hessian if icgn_result else None),
-                    icgn_cost_curvature=(icgn_result.cost_curvature if icgn_result else None),
+                    cost_curvature=zncc_cost_curvature,
+                    icgn_cost_curvature=zncc_cost_curvature,
+                    icgn_hessian_density=(icgn_result.hessian_density if icgn_result else None),
+                    icgn_termination_reason=(icgn_result.termination_reason if icgn_result else ""),
+                    icgn_fallback_used=icgn_fallback_used,
+                    icgn_fallback_method=icgn_fallback_method,
+                    icgn_iterative_disparity=(icgn_result.iterative_disparity if icgn_result else None),
+                    icgn_final_increment_px=(icgn_result.final_increment_px if icgn_result else None),
+                    subpixel_final_status=subpixel_final_status,
+                    zncc_cost_curvature=zncc_cost_curvature,
+                    curvature_sample_step_px=(
+                        self.config.curvature_sample_step_px
+                        if zncc_cost_curvature is not None
+                        else None
+                    ),
                     temporal_right_xy=temporal_right_xy,
                     cycle_error_px=cycle_error,
                     right_flow_fb_error_px=right_flow_fb_error_px,
@@ -343,13 +410,26 @@ class LocalMatcher:
             second_best_cost=second_cost,
             uniqueness_margin_value=margin,
             texture_std=texture_std,
-            cost_curvature=(icgn_result.cost_curvature if icgn_result else None),
+            cost_curvature=zncc_cost_curvature,
             icgn_status=icgn_output_status,
             icgn_converged=(icgn_result.converged if icgn_result else False),
             icgn_iterations=(icgn_result.iterations if icgn_result else 0),
             icgn_residual=(icgn_result.residual_rms if icgn_result else None),
             icgn_hessian=(icgn_result.hessian if icgn_result else None),
-            icgn_cost_curvature=(icgn_result.cost_curvature if icgn_result else None),
+            icgn_cost_curvature=zncc_cost_curvature,
+            icgn_hessian_density=(icgn_result.hessian_density if icgn_result else None),
+            icgn_termination_reason=(icgn_result.termination_reason if icgn_result else ""),
+            icgn_fallback_used=icgn_fallback_used,
+            icgn_fallback_method=icgn_fallback_method,
+            icgn_iterative_disparity=(icgn_result.iterative_disparity if icgn_result else None),
+            icgn_final_increment_px=(icgn_result.final_increment_px if icgn_result else None),
+            subpixel_final_status=subpixel_final_status,
+            zncc_cost_curvature=zncc_cost_curvature,
+            curvature_sample_step_px=(
+                self.config.curvature_sample_step_px
+                if zncc_cost_curvature is not None
+                else None
+            ),
             temporal_right_xy=temporal_right_xy,
             cycle_error_px=cycle_error,
             right_flow_fb_error_px=right_flow_fb_error_px,
@@ -550,6 +630,76 @@ class LocalMatcher:
                 best_cost = cost
                 best_offset = float(offset)
         return float(np.clip(best_offset, -1.0, 1.0))
+
+    def _line_search_refine(
+        self,
+        left_patch: np.ndarray,
+        right_gray: np.ndarray,
+        left_xy: tuple[float, float],
+        center_disparity: float,
+        vertical_offset: int,
+    ) -> float:
+        radius = self.config.icgn_fallback_search_radius_px
+        values = np.linspace(
+            center_disparity - radius,
+            center_disparity + radius,
+            self.config.icgn_fallback_sample_count,
+        )
+        costs = np.full(values.shape, np.inf, dtype=np.float64)
+        for index, candidate in enumerate(values):
+            patch = self._extract_patch(
+                right_gray,
+                (left_xy[0] - float(candidate), left_xy[1] + vertical_offset),
+            )
+            if patch is not None:
+                costs[index] = self._zncc_cost(left_patch, patch)
+        if not np.isfinite(costs).any():
+            return float(center_disparity)
+        best_index = int(np.nanargmin(costs))
+        best_disparity = float(values[best_index])
+        if best_index == 0 or best_index == len(values) - 1:
+            return best_disparity
+        c_minus, c_zero, c_plus = costs[best_index - 1:best_index + 2]
+        denominator = c_minus - 2.0 * c_zero + c_plus
+        if not np.isfinite(denominator) or denominator <= 1e-12:
+            return best_disparity
+        sample_step = float(values[1] - values[0])
+        fractional = 0.5 * (c_minus - c_plus) / denominator
+        return float(best_disparity + np.clip(fractional, -1.0, 1.0) * sample_step)
+
+    def _zncc_cost_curvature(
+        self,
+        left_patch: np.ndarray,
+        right_gray: np.ndarray,
+        left_xy: tuple[float, float],
+        disparity: float,
+        vertical_offset: int,
+    ) -> float | None:
+        delta = self.config.curvature_sample_step_px
+        costs: list[float] = []
+        for candidate in (disparity - delta, disparity, disparity + delta):
+            patch = self._extract_patch(
+                right_gray,
+                (left_xy[0] - candidate, left_xy[1] + vertical_offset),
+            )
+            if patch is None:
+                return None
+            costs.append(self._zncc_cost(left_patch, patch))
+        c_minus, c_zero, c_plus = costs
+        raw_curvature = (c_minus - 2.0 * c_zero + c_plus) / (delta * delta)
+        return sanitize_cost_curvature(raw_curvature, self.config)
+
+    @staticmethod
+    def _zncc_cost(left_patch: np.ndarray, right_patch: np.ndarray) -> float:
+        left_f = left_patch.astype(np.float64, copy=False)
+        right_f = right_patch.astype(np.float64, copy=False)
+        left_centered = left_f - float(left_f.mean())
+        right_centered = right_f - float(right_f.mean())
+        denominator = float(np.linalg.norm(left_centered) * np.linalg.norm(right_centered))
+        if denominator <= 1e-12:
+            return float("inf")
+        zncc = float(np.sum(left_centered * right_centered) / denominator)
+        return float(np.clip((1.0 - zncc) * 0.5, 0.0, 1.0))
 
     def _left_right_error(
         self,

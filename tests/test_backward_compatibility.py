@@ -112,6 +112,28 @@ def test_old_csv_fields_keep_their_original_order_as_prefix() -> None:
     assert CSV_FIELDS[: len(old_fields)] == old_fields
 
 
+def test_second_round_csv_fields_are_appended_without_removing_old_fields() -> None:
+    required = {
+        "measurement_accepted_for_state",
+        "state_update_source",
+        "kalman_predict_only_frames",
+        "right_flow_reference_frame",
+        "right_reference_source",
+        "right_reference_age_frames",
+        "icgn_termination_reason",
+        "icgn_fallback_used",
+        "icgn_fallback_method",
+        "icgn_iterative_disparity",
+        "icgn_final_increment_px",
+        "subpixel_final_status",
+        "icgn_hessian_density",
+        "zncc_cost_curvature",
+        "curvature_sample_step_px",
+    }
+
+    assert required <= set(CSV_FIELDS)
+
+
 @pytest.mark.parametrize(
     "kwargs, message",
     [

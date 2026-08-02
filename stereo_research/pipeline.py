@@ -128,9 +128,9 @@ class TemporalStereoPipeline:
                     matching_ms=initialization_matching_ms,
                     total_ms=initialization_matching_ms,
                 )
-            results.append(result)
             if result.status == "valid":
-                self.right_flow_reference_gray[point.point_id] = right_gray.copy()
+                result = self._finalize_right_flow_reference(result, frame, right_gray)
+            results.append(result)
         self.previous_left_gray = left_gray.copy()
         self.previous_right_gray = right_gray.copy()
         self.initialized = True
@@ -228,17 +228,24 @@ class TemporalStereoPipeline:
             else:
                 state.left_xy = state.initial_left_xy
 
-            if (
-                self.profile.use_cycle_consistency
-                and self.config.enable_cycle_consistency
-                and state.right_xy is not None
-                and state.point_id in self.right_flow_reference_gray
-            ):
+            if self.profile.use_cycle_consistency and self.config.enable_cycle_consistency:
+                reference_image, reference_xy, reference_status = self._right_flow_reference(
+                    state.point_id,
+                    current_frame=frame,
+                )
+                if reference_status == "invalid_right_reference":
+                    cycle_status = reference_status
+                elif reference_status != "valid":
+                    cycle_status = "not_attempted"
+            else:
+                reference_image, reference_xy, reference_status = None, None, "not_enabled"
+            if reference_status == "valid":
+                assert reference_image is not None and reference_xy is not None
                 right_flow_start = time.perf_counter()
                 right_flow = track_xy_lk(
-                    self.right_flow_reference_gray[state.point_id],
+                    reference_image,
                     right_gray,
-                    previous_xy=state.right_flow_reference_xy or state.right_xy,
+                    previous_xy=reference_xy,
                     initial_velocity=state.right_velocity,
                     config=self.config,
                     recovery=recovery_attempt,
@@ -289,7 +296,12 @@ class TemporalStereoPipeline:
                 )
                 continue
 
-            latest = state.disparity
+            prediction_history = (
+                state.estimated_disparity_history
+                if self.method == "research_full" and state.estimated_disparity_history
+                else state.disparity_history
+            )
+            latest = prediction_history[-1] if prediction_history else None
             if latest is None:
                 if recovery_attempt:
                     recovery_start = time.perf_counter()
@@ -328,9 +340,13 @@ class TemporalStereoPipeline:
                                 flow_error,
                                 recovery_stage="sgbm_reinitialized",
                             )
-                        results.append(recovered_result)
                         if recovered_result.status == "valid":
-                            self.right_flow_reference_gray[state.point_id] = right_gray.copy()
+                            recovered_result = self._finalize_right_flow_reference(
+                                recovered_result,
+                                frame,
+                                right_gray,
+                            )
+                        results.append(recovered_result)
                         continue
                 state.record_failure("ambiguous", self.config.max_failures)
                 results.append(
@@ -349,7 +365,7 @@ class TemporalStereoPipeline:
             predicted = (
                 predict_disparity(
                     latest,
-                    state.previous_disparity,
+                    prediction_history[-2] if len(prediction_history) >= 2 else None,
                     self.config.max_disparity_velocity,
                 )
                 if self.profile.use_prediction and self.config.enable_prediction
@@ -448,8 +464,7 @@ class TemporalStereoPipeline:
                     cycle_error_px=cycle_check.error_px,
                     cycle_cost=cycle_check.cost,
                 )
-            results.append(
-                self._valid_result(
+            point_result = self._valid_result(
                     frame,
                     state,
                     match.right_xy,
@@ -486,15 +501,105 @@ class TemporalStereoPipeline:
                     icgn_residual=match.icgn_residual,
                     icgn_hessian=match.icgn_hessian,
                     icgn_cost_curvature=match.icgn_cost_curvature,
+                    icgn_hessian_density=match.icgn_hessian_density,
+                    zncc_cost_curvature=match.zncc_cost_curvature,
+                    curvature_sample_step_px=match.curvature_sample_step_px,
+                    icgn_termination_reason=match.icgn_termination_reason,
+                    icgn_fallback_used=match.icgn_fallback_used,
+                    icgn_fallback_method=match.icgn_fallback_method,
+                    icgn_iterative_disparity=match.icgn_iterative_disparity,
+                    icgn_final_increment_px=match.icgn_final_increment_px,
+                    subpixel_final_status=match.subpixel_final_status,
                 )
-            )
-            if results[-1].status == "valid" and temporal_right_xy is not None:
+            if point_result.status == "valid":
+                point_result = self._finalize_right_flow_reference(
+                    point_result,
+                    frame,
+                    right_gray,
+                )
+            results.append(point_result)
+            if point_result.status == "valid" and temporal_right_xy is not None:
                 state.last_cycle_error_px = match.cycle_error_px
                 state.last_right_flow_fb_error_px = right_flow_error
-                self.right_flow_reference_gray[state.point_id] = right_gray.copy()
         self.previous_left_gray = left_gray.copy()
         self.previous_right_gray = right_gray.copy()
         return self._apply_camera_compensation(results)
+
+    def _update_right_flow_reference(
+        self,
+        point_id: str,
+        frame: int,
+        right_gray: np.ndarray,
+        right_xy: tuple[float, float],
+    ) -> None:
+        """Atomically update all right temporal-reference components."""
+        if point_id not in self.states:
+            raise KeyError(f"Unknown point id: {point_id}")
+        self.right_flow_reference_gray[point_id] = right_gray.copy()
+        self.states[point_id].set_right_flow_reference(frame, right_xy)
+
+    def _right_flow_reference(
+        self,
+        point_id: str,
+        current_frame: int,
+    ) -> tuple[np.ndarray | None, tuple[float, float] | None, str]:
+        state = self.states[point_id]
+        image = self.right_flow_reference_gray.get(point_id)
+        xy = state.right_flow_reference_xy
+        reference_frame = state.right_flow_reference_frame
+        if image is None or xy is None or reference_frame is None:
+            return None, None, "not_attempted"
+        if reference_frame >= current_frame:
+            return None, None, "invalid_right_reference"
+        return image, xy, "valid"
+
+    def _finalize_right_flow_reference(
+        self,
+        result: FramePointResult,
+        frame: int,
+        right_gray: np.ndarray,
+    ) -> FramePointResult:
+        if not (
+            self.profile.use_cycle_consistency
+            and self.config.enable_cycle_consistency
+            and result.status == "valid"
+        ):
+            return result
+        if result.measurement_accepted_for_state:
+            xy = (result.measured_right_x, result.measured_right_y)
+            source = "measured"
+        else:
+            xy = (result.estimated_right_x, result.estimated_right_y)
+            source = "estimated"
+        if any(value is None or not np.isfinite(value) for value in xy):
+            reference_frame = self.states[result.point_id].right_flow_reference_frame
+            return replace(
+                result,
+                right_flow_reference_frame=reference_frame,
+                right_reference_source="retained",
+                right_reference_age_frames=(
+                    frame - reference_frame if reference_frame is not None else None
+                ),
+            )
+        right_xy = (float(xy[0]), float(xy[1]))
+        height, width = right_gray.shape[:2]
+        if not (0.0 <= right_xy[0] < width and 0.0 <= right_xy[1] < height):
+            reference_frame = self.states[result.point_id].right_flow_reference_frame
+            return replace(
+                result,
+                right_flow_reference_frame=reference_frame,
+                right_reference_source="retained",
+                right_reference_age_frames=(
+                    frame - reference_frame if reference_frame is not None else None
+                ),
+            )
+        self._update_right_flow_reference(result.point_id, frame, right_gray, right_xy)
+        return replace(
+            result,
+            right_flow_reference_frame=frame,
+            right_reference_source=source,
+            right_reference_age_frames=0,
+        )
 
     def _apply_camera_compensation(
         self,
@@ -674,6 +779,15 @@ class TemporalStereoPipeline:
         icgn_residual: float | None = None,
         icgn_hessian: float | None = None,
         icgn_cost_curvature: float | None = None,
+        icgn_hessian_density: float | None = None,
+        zncc_cost_curvature: float | None = None,
+        curvature_sample_step_px: float | None = None,
+        icgn_termination_reason: str = "",
+        icgn_fallback_used: bool = False,
+        icgn_fallback_method: str = "none",
+        icgn_iterative_disparity: float | None = None,
+        icgn_final_increment_px: float | None = None,
+        subpixel_final_status: str = "not_attempted",
     ) -> FramePointResult:
         measured = float(
             measured_disparity
@@ -742,6 +856,9 @@ class TemporalStereoPipeline:
         kalman_gain_disparity: float | None = None
         kalman_nis: float | None = None
         kalman_update_status = "not_used"
+        kalman_predict_only_frames = 0
+        measurement_accepted_for_state = True
+        state_update_source = "measured"
         kalman_recovery_needed = False
         latest_valid = state.disparity
         if (
@@ -760,6 +877,7 @@ class TemporalStereoPipeline:
                 icgn_residual=icgn_residual,
                 icgn_hessian=icgn_hessian,
                 config=self.config,
+                icgn_hessian_density=icgn_hessian_density,
             )
             left_variance_px2 = uncertainty.left_position_variance_px2
             disparity_variance_px2 = uncertainty.disparity_variance_px2
@@ -785,6 +903,14 @@ class TemporalStereoPipeline:
                 kalman_gain_disparity = update.kalman_gain_disparity
                 kalman_nis = update.nis
                 kalman_update_status = update.status
+                kalman_predict_only_frames = point_filter.predict_only_frames
+                measurement_accepted_for_state = update.status in {
+                    "updated",
+                    "variance_inflated",
+                }
+                state_update_source = (
+                    "filtered" if measurement_accepted_for_state else "predicted"
+                )
                 kalman_recovery_needed = (
                     update.status == "predict_only_outlier"
                     and point_filter.predict_only_frames
@@ -844,20 +970,42 @@ class TemporalStereoPipeline:
             and self.config.enable_recovery
             and state.status in {"recovering", "lost"}
         )
-        state.record_stereo_measurement(
-            right_xy,
-            measured,
-            confidence,
-            estimated_disparity=estimated,
-            xyz=measured_xyz,
-            estimated_xyz=estimated_xyz,
-        )
+        if measurement_accepted_for_state:
+            state.record_stereo_measurement(
+                right_xy,
+                measured,
+                confidence,
+                estimated_disparity=estimated,
+                xyz=measured_xyz,
+                estimated_xyz=estimated_xyz,
+            )
+            if state_update_source == "filtered":
+                state.left_xy = estimated_left_xy
+                state.right_xy = estimated_right
+                state.latest_disparity = estimated
+                state.last_estimated_left_xy = estimated_left_xy
+                state.last_estimated_right_xy = estimated_right
+                state.last_estimated_disparity = estimated
+        else:
+            quality_stage = (
+                f"{quality_stage}_kalman_predict_only"
+                if quality_stage
+                else "kalman_predict_only"
+            )
+            state.record_estimated_only(
+                estimated_left_xy=estimated_left_xy,
+                estimated_right_xy=estimated_right,
+                estimated_disparity=estimated,
+                estimated_xyz_m=estimated_xyz,
+                frame=frame,
+                quality_stage=quality_stage,
+            )
         state.confirm_valid(confidence)
         if kalman_recovery_needed:
             state.status = "recovering"
             if state.recovery_started_frame is None:
                 state.recovery_started_frame = frame
-        if was_recovering:
+        if was_recovering and measurement_accepted_for_state:
             state.confirm_recovery(frame)
         reference = state.reference_estimated_xyz or estimated_xyz
         delta_mm = tuple(
@@ -930,6 +1078,15 @@ class TemporalStereoPipeline:
             icgn_residual=icgn_residual,
             icgn_hessian=icgn_hessian,
             icgn_cost_curvature=icgn_cost_curvature,
+            icgn_hessian_density=icgn_hessian_density,
+            zncc_cost_curvature=zncc_cost_curvature,
+            curvature_sample_step_px=curvature_sample_step_px,
+            icgn_termination_reason=icgn_termination_reason,
+            icgn_fallback_used=icgn_fallback_used,
+            icgn_fallback_method=icgn_fallback_method,
+            icgn_iterative_disparity=icgn_iterative_disparity,
+            icgn_final_increment_px=icgn_final_increment_px,
+            subpixel_final_status=subpixel_final_status,
             point_role=state.point_role,
             final_x_m=estimated_xyz[0],
             final_y_m=estimated_xyz[1],
@@ -947,6 +1104,9 @@ class TemporalStereoPipeline:
             kalman_gain_disparity=kalman_gain_disparity,
             kalman_nis=kalman_nis,
             kalman_update_status=kalman_update_status,
+            kalman_predict_only_frames=kalman_predict_only_frames,
+            measurement_accepted_for_state=measurement_accepted_for_state,
+            state_update_source=state_update_source,
         )
 
     @staticmethod

@@ -3,12 +3,13 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+import stereo_research.pipeline as pipeline_module
 from stereo_research.cycle_consistency import evaluate_cycle_consistency
 from stereo_research.local_matching import LocalMatcher
-from stereo_research.models import MatcherConfig, method_profile
+from stereo_research.models import MatcherConfig, PointState, method_profile
 from stereo_research.models import PointSpec
 from stereo_research.pipeline import TemporalStereoPipeline
-from stereo_research.tracking import track_xy_lk
+from stereo_research.tracking import FlowResult, track_xy_lk
 
 
 def _texture() -> np.ndarray:
@@ -200,3 +201,109 @@ def test_research_sgbm_recapture_restores_right_flow_reference() -> None:
     assert recovered.status == "valid"
     assert "P1" in pipeline.right_flow_reference_gray
     assert state.right_flow_reference_xy is not None
+    assert state.right_flow_reference_frame == 1
+
+
+def test_right_reference_image_and_coordinate_are_synchronized() -> None:
+    q = np.eye(4, dtype=np.float64)
+    pipeline = TemporalStereoPipeline("research_full", q, "m", MatcherConfig())
+    state = PointState("P1", (30.0, 20.0), (30.0, 20.0))
+    pipeline.states["P1"] = state
+    reference_image = np.full((40, 60), 17, dtype=np.uint8)
+
+    pipeline._update_right_flow_reference("P1", 3, reference_image, (21.0, 20.0))
+    reference_image[:] = 99
+
+    assert state.right_flow_reference_frame == 3
+    assert state.right_flow_reference_xy == (21.0, 20.0)
+    assert np.all(pipeline.right_flow_reference_gray["P1"] == 17)
+    state.record_stereo_measurement((5.0, 5.0), 25.0, 1.0)
+    assert state.right_flow_reference_frame == 3
+    assert state.right_flow_reference_xy == (21.0, 20.0)
+
+    image, xy, status = pipeline._right_flow_reference("P1", current_frame=4)
+    assert status == "valid"
+    assert image is not None and xy == (21.0, 20.0)
+    state.right_flow_reference_frame = 4
+    _, _, status = pipeline._right_flow_reference("P1", current_frame=4)
+    assert status == "invalid_right_reference"
+
+
+def test_kalman_rejected_right_measurement_is_not_used_as_reference() -> None:
+    q = np.array(
+        [[1, 0, 0, -100], [0, 1, 0, -60], [0, 0, 0, 100], [0, 0, 10, 0]],
+        dtype=np.float64,
+    )
+    pipeline = TemporalStereoPipeline("research_full", q, "m", MatcherConfig())
+    state = PointState("P1", (120.0, 65.0), (120.0, 65.0))
+    pipeline.states["P1"] = state
+    right_gray = np.zeros((120, 200), dtype=np.uint8)
+    first = pipeline._valid_result(
+        0, state, (110.0, 65.0), 10.0, 0.02, 0.02, 0.95, 0, 0, 0,
+        texture_std=30.0, uniqueness_margin_value=0.3, cost_curvature=2.0,
+    )
+    pipeline._finalize_right_flow_reference(first, 0, right_gray)
+    for frame in range(1, 4):
+        result = pipeline._valid_result(
+            frame, state, (110.0, 65.0), 10.0, 0.02, 0.02, 0.95, 0, 0, 0,
+            texture_std=30.0, uniqueness_margin_value=0.3, cost_curvature=2.0,
+        )
+        pipeline._finalize_right_flow_reference(result, frame, right_gray)
+
+    rejected = pipeline._valid_result(
+        4, state, (95.0, 65.0), 25.0, 0.02, 0.02, 0.95, 0, 0, 0,
+        texture_std=30.0, uniqueness_margin_value=0.3, cost_curvature=2.0,
+    )
+    finalized = pipeline._finalize_right_flow_reference(rejected, 4, right_gray)
+
+    assert rejected.kalman_update_status == "predict_only_outlier"
+    assert finalized.right_reference_source == "estimated"
+    assert state.right_flow_reference_frame == 4
+    assert state.right_flow_reference_xy == (
+        rejected.estimated_right_x,
+        rejected.estimated_right_y,
+    )
+    assert state.right_flow_reference_xy != (95.0, 65.0)
+
+
+def test_failed_right_flow_then_stereo_success_refreshes_entire_reference(
+    monkeypatch,
+) -> None:
+    left = _texture()
+    right = cv2.warpAffine(
+        left,
+        np.array([[1.0, 0.0, -8.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        (left.shape[1], left.shape[0]),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REFLECT101,
+    )
+    q = np.array(
+        [[1, 0, 0, -100], [0, 1, 0, -60], [0, 0, 0, 100], [0, 0, 10, 0]],
+        dtype=np.float64,
+    )
+    pipeline = TemporalStereoPipeline(
+        "research_full",
+        q,
+        "m",
+        MatcherConfig(uniqueness_margin=0.005),
+    )
+    initial = pipeline.initialize(left, right, (PointSpec("P1", (120.0, 65.0)),), 0)[0]
+    assert initial.status == "valid"
+    monkeypatch.setattr(
+        pipeline_module,
+        "track_xy_lk",
+        lambda *args, **kwargs: FlowResult(status="flow_failed"),
+    )
+
+    current = pipeline.step(left, right, 1)[0]
+    state = pipeline.states["P1"]
+
+    assert current.status == "valid"
+    assert current.cycle_status == "right_flow_failed"
+    assert current.right_reference_source == "measured"
+    assert state.right_flow_reference_frame == 1
+    assert state.right_flow_reference_xy == (
+        current.measured_right_x,
+        current.measured_right_y,
+    )
+    assert np.array_equal(pipeline.right_flow_reference_gray["P1"], right)

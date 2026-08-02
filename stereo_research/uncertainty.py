@@ -27,6 +27,7 @@ def estimate_match_uncertainty(
     icgn_residual: float | None,
     icgn_hessian: float | None,
     config: MatcherConfig,
+    icgn_hessian_density: float | None = None,
 ) -> MatchUncertainty:
     maximum = config.uncertainty_max_component
     epsilon = 1e-9
@@ -67,18 +68,26 @@ def estimate_match_uncertainty(
     flow_risk = sum(flow_values) / max(present_flow_count, 1)
     lr_risk = ratio(lr_error_px, config.lr_threshold)
     cycle_risk = ratio(cycle_error_px, config.cycle_hard_threshold_px)
-    icgn_parts: list[float] = []
-    if icgn_residual is not None:
-        icgn_parts.append(ratio(icgn_residual, config.icgn_max_residual))
-    if icgn_hessian is not None and np.isfinite(icgn_hessian):
-        icgn_parts.append(
-            float(np.clip(1.0 / max(icgn_hessian, epsilon), 0.0, maximum))
+    icgn_risk = ratio(icgn_residual, config.icgn_max_residual)
+    density = icgn_hessian_density
+    if density is None and icgn_hessian is not None and np.isfinite(icgn_hessian):
+        density = float(icgn_hessian) / float(config.icgn_patch_size ** 2)
+    icgn_hessian_risk = (
+        0.0
+        if density is None or not np.isfinite(density)
+        else float(np.clip(1.0 / max(density, epsilon), 0.0, maximum))
+    )
+    curvature_risk = (
+        maximum
+        if cost_curvature is None or not np.isfinite(cost_curvature)
+        else float(
+            np.clip(
+                config.uncertainty_curvature_reference / max(cost_curvature, epsilon),
+                0.0,
+                maximum,
+            )
         )
-    if cost_curvature is not None and np.isfinite(cost_curvature):
-        icgn_parts.append(
-            float(np.clip(0.1 / max(cost_curvature, epsilon), 0.0, maximum))
-        )
-    icgn_risk = float(np.mean(icgn_parts)) if icgn_parts else 0.0
+    )
 
     components = {
         "texture": texture_risk,
@@ -88,6 +97,8 @@ def estimate_match_uncertainty(
         "lr": lr_risk,
         "cycle": cycle_risk,
         "icgn": icgn_risk,
+        "icgn_hessian": icgn_hessian_risk,
+        "curvature": curvature_risk,
     }
     weighted_risk = (
         config.uncertainty_weight_texture * texture_risk
@@ -97,6 +108,8 @@ def estimate_match_uncertainty(
         + config.uncertainty_weight_lr * lr_risk
         + config.uncertainty_weight_cycle * cycle_risk
         + config.uncertainty_weight_icgn * icgn_risk
+        + config.uncertainty_weight_icgn_hessian * icgn_hessian_risk
+        + config.uncertainty_weight_curvature * curvature_risk
     )
     disparity_variance = float(
         np.clip(

@@ -112,6 +112,29 @@ def test_match_uncertainty_increases_for_poor_quality() -> None:
     assert set(good.components) >= {"texture", "photo", "margin", "flow", "lr", "cycle", "icgn"}
 
 
+def test_lower_true_cost_curvature_increases_disparity_variance() -> None:
+    config = MatcherConfig()
+    common = dict(
+        texture_std=25.0,
+        photo_cost=0.05,
+        uniqueness_margin=0.2,
+        flow_fb_error_px=0.1,
+        right_flow_fb_error_px=0.1,
+        lr_error_px=0.1,
+        cycle_error_px=0.1,
+        icgn_residual=0.05,
+        icgn_hessian=100.0,
+        icgn_hessian_density=1.0,
+        config=config,
+    )
+
+    sharp = estimate_match_uncertainty(cost_curvature=2.0, **common)
+    flat = estimate_match_uncertainty(cost_curvature=0.002, **common)
+
+    assert flat.components["curvature"] > sharp.components["curvature"]
+    assert flat.disparity_variance_px2 > sharp.disparity_variance_px2
+
+
 def test_research_pipeline_keeps_measurement_and_adaptive_estimate_separate() -> None:
     q = np.array(
         [[1, 0, 0, -100], [0, 1, 0, -60], [0, 0, 0, 100], [0, 0, 10, 0]],
@@ -175,3 +198,47 @@ def test_repeated_predict_only_updates_put_point_into_recovery() -> None:
 
     assert last.kalman_update_status == "predict_only_outlier"
     assert state.status == "recovering"
+
+
+def test_rejected_measurement_does_not_pollute_state() -> None:
+    q = np.array(
+        [[1, 0, 0, -100], [0, 1, 0, -60], [0, 0, 0, 100], [0, 0, 10, 0]],
+        dtype=np.float64,
+    )
+    pipeline = TemporalStereoPipeline(
+        "research_full",
+        q=q,
+        calibration_unit="m",
+        config=MatcherConfig(),
+    )
+    state = PointState("P1", (120.0, 65.0), (120.0, 65.0))
+    pipeline.states["P1"] = state
+
+    pipeline._valid_result(
+        0, state, (110.0, 65.0), 10.0, 0.02, 0.02, 0.95, 0.0, 0.0, 0.0,
+        texture_std=30.0, uniqueness_margin_value=0.3, cost_curvature=2.0,
+    )
+    for frame in range(1, 5):
+        pipeline._valid_result(
+            frame, state, (110.0, 65.0), 10.0, 0.02, 0.02, 0.95, 0.0, 0.0, 0.0,
+            texture_std=30.0, uniqueness_margin_value=0.3, cost_curvature=2.0,
+        )
+
+    accepted_history = list(state.disparity_history)
+    last_accepted_right = state.last_accepted_measured_right_xy
+    rejected = pipeline._valid_result(
+        5, state, (95.0, 65.0), 25.0, 0.02, 0.02, 0.95, 0.0, 0.0, 0.0,
+        texture_std=30.0, uniqueness_margin_value=0.3, cost_curvature=2.0,
+    )
+
+    assert rejected.status == "valid"
+    assert rejected.kalman_update_status == "predict_only_outlier"
+    assert rejected.measured_disparity == 25.0
+    assert rejected.measurement_accepted_for_state is False
+    assert rejected.state_update_source == "predicted"
+    assert state.disparity_history == accepted_history
+    assert state.last_accepted_measured_right_xy == last_accepted_right
+    assert state.last_accepted_measured_disparity == 10.0
+    assert state.disparity is not None and abs(state.disparity - 10.0) < 0.2
+    assert state.right_xy is not None and abs(state.right_xy[0] - 110.0) < 0.2
+    assert state.estimated_disparity_history[-1] == state.disparity
