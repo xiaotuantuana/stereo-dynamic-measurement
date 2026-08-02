@@ -13,6 +13,7 @@ stereo_point_cloud_outputs/
 experiments/**/results/
 experiments/**/report/
 experiments/**/report_*/
+experiments/gui_validation/
 
 # Large local assets and generated model artifacts
 *.avi

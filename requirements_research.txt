@@ -2,3 +2,5 @@ numpy>=1.26
 opencv-python>=4.8
 matplotlib>=3.8
 pytest>=8
+PySide6-Essentials>=6.8
+pytest-qt>=4.4

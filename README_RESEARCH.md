@@ -1,5 +1,15 @@
 # 时空预测驱动的局部双目匹配研究代码
 
+## 图形化测量软件
+
+双击项目根目录中的 `启动双目测量软件.bat`，或在 PowerShell 中运行：
+
+```powershell
+python -m stereo_research.gui
+```
+
+使用流程：选择左右并排的双目视频，设置起止帧，在左相机视图中选择测量点（完整研究方法可额外选择静态参考点），选择方法后启动处理。详细匹配、光流、闭环、卡尔曼和恢复参数默认折叠，需要时点击“高级参数”展开。结果自动保存到输入视频同级的 `stereo_outputs` 目录。
+
 论文升级版完整方法为 `research_full`。新增四视图闭环、IC-GN、自适应卡尔曼和静态参考点
 相机补偿的说明与运行命令见 [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md)。
 
