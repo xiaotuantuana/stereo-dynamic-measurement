@@ -6,9 +6,10 @@
 ## 验证结论
 
 - `python -m compileall -q stereo_research tests`：通过。
-- `python -m pytest -q`：149 项全部通过，0 失败，用时 26.06 s。
+- `python -m pytest -q`：150 项全部通过，0 失败，用时 26.10 s。
 - GUI 专项测试：14 项全部通过，包括视频格式检查、坐标映射、参数配置、后台线程、CSV 输出和安全关闭。
 - 启动入口 `python -m stereo_research.gui`：启动后连续存活 3 s，无提前退出。
+- Windows 双击启动器：已改为 ASCII + CRLF 的 `cmd.exe` 兼容格式；实测能正常创建 GUI Python 进程。
 
 ## `car.avi` 实际试运行
 

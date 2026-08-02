@@ -33,6 +33,15 @@ def test_configure_application_sets_product_identity(qapp) -> None:
     assert qapp.font().pointSize() >= 9
 
 
+def test_windows_launcher_uses_cmd_compatible_crlf_and_ascii() -> None:
+    launcher = Path(__file__).resolve().parents[1] / "启动双目测量软件.bat"
+    raw = launcher.read_bytes()
+
+    assert b"\r\n" in raw
+    assert b"\n" not in raw.replace(b"\r\n", b"")
+    raw.decode("ascii")
+
+
 def test_clicking_visible_image_selects_the_matching_image_coordinate(qtbot) -> None:
     view = AspectImageView("左相机 / LEFT")
     qtbot.addWidget(view)
