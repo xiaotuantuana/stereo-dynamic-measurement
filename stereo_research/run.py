@@ -27,12 +27,23 @@ def main() -> None:
     parser.add_argument("--disable-pyramid", action="store_true")
     parser.add_argument("--disable-recovery", action="store_true")
     parser.add_argument("--disable-temporal-estimation", action="store_true")
+    parser.add_argument("--disable-cycle-consistency", action="store_true")
+    parser.add_argument("--disable-icgn", action="store_true")
+    parser.add_argument("--disable-adaptive-filter", action="store_true")
+    parser.add_argument("--disable-camera-compensation", action="store_true")
     parser.add_argument(
         "--subpixel-method",
-        choices=("continuous", "parabolic"),
-        default="continuous",
+        choices=("continuous", "parabolic", "icgn"),
+        default=None,
     )
     parser.add_argument("--subpixel-step", type=float, default=0.1)
+    parser.add_argument("--cycle-soft-threshold", type=float)
+    parser.add_argument("--cycle-hard-threshold", type=float)
+    parser.add_argument("--cycle-weight", type=float)
+    parser.add_argument("--icgn-patch-size", type=int)
+    parser.add_argument("--icgn-max-iterations", type=int)
+    parser.add_argument("--icgn-epsilon", type=float)
+    parser.add_argument("--camera-compensation-inlier-threshold-mm", type=float)
     parser.add_argument(
         "--ablation-suite",
         action="store_true",
@@ -51,8 +62,29 @@ def main() -> None:
         enable_pyramid=not args.disable_pyramid,
         enable_recovery=not args.disable_recovery,
         enable_temporal_estimation=not args.disable_temporal_estimation,
-        subpixel_method=args.subpixel_method,
         subpixel_step=args.subpixel_step,
+        enable_cycle_consistency=not args.disable_cycle_consistency,
+        enable_icgn=not args.disable_icgn,
+        enable_adaptive_filter=not args.disable_adaptive_filter,
+        enable_camera_compensation=not args.disable_camera_compensation,
+    )
+    optional_updates = {
+        "cycle_soft_threshold_px": args.cycle_soft_threshold,
+        "cycle_hard_threshold_px": args.cycle_hard_threshold,
+        "cycle_weight": args.cycle_weight,
+        "icgn_patch_size": args.icgn_patch_size,
+        "icgn_max_iterations": args.icgn_max_iterations,
+        "icgn_epsilon": args.icgn_epsilon,
+        "camera_compensation_inlier_threshold_mm": (
+            args.camera_compensation_inlier_threshold_mm
+        ),
+    }
+    if args.subpixel_method is not None:
+        optional_updates["subpixel_method"] = args.subpixel_method
+        optional_updates["research_subpixel_method"] = args.subpixel_method
+    config = replace(
+        config,
+        **{key: value for key, value in optional_updates.items() if value is not None},
     )
     if args.ablation_suite:
         outputs = run_ablation_suite(

@@ -23,22 +23,41 @@ def track_point_lk(
     config: MatcherConfig,
     recovery: bool = False,
 ) -> FlowResult:
+    return track_xy_lk(
+        previous_gray,
+        current_gray,
+        previous_xy=state.left_xy,
+        initial_velocity=state.velocity,
+        config=config,
+        recovery=recovery,
+    )
+
+
+def track_xy_lk(
+    previous_gray: np.ndarray,
+    current_gray: np.ndarray,
+    previous_xy: tuple[float, float],
+    initial_velocity: tuple[float, float],
+    config: MatcherConfig,
+    recovery: bool = False,
+    fb_threshold: float | None = None,
+) -> FlowResult:
     if previous_gray.ndim != 2 or current_gray.ndim != 2:
         raise ValueError("LK tracking expects grayscale images")
     if previous_gray.shape != current_gray.shape:
         raise ValueError("Previous and current frames must have identical shapes")
-    if not _point_has_patch(state.left_xy, previous_gray.shape, config.patch_size):
+    if not _point_has_patch(previous_xy, previous_gray.shape, config.patch_size):
         return FlowResult(status="out_of_bounds")
     patch = cv2.getRectSubPix(
         previous_gray,
         (config.patch_size, config.patch_size),
-        state.left_xy,
+        previous_xy,
     )
     if float(np.std(patch)) < config.min_texture_std:
         return FlowResult(status="low_texture")
 
-    previous_point = np.asarray(state.left_xy, dtype=np.float32).reshape(1, 1, 2)
-    velocity = np.asarray(state.velocity, dtype=np.float32)
+    previous_point = np.asarray(previous_xy, dtype=np.float32).reshape(1, 1, 2)
+    velocity = np.asarray(initial_velocity, dtype=np.float32)
     initial_current = (previous_point.reshape(2) + velocity).reshape(1, 1, 2)
     criteria = (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
@@ -88,7 +107,10 @@ def track_point_lk(
         return FlowResult(status="flow_failed", left_xy=current_xy)
     fb_error = float(np.linalg.norm(backward_point.reshape(2) - previous_point.reshape(2)))
     lk_error = float(error_forward.reshape(-1)[0]) if error_forward is not None else None
-    if fb_error > config.flow_fb_threshold:
+    threshold = config.flow_fb_threshold if fb_threshold is None else float(fb_threshold)
+    if threshold <= 0:
+        raise ValueError("fb_threshold must be positive")
+    if fb_error > threshold:
         return FlowResult(
             status="flow_failed",
             left_xy=current_xy,

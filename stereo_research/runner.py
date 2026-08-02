@@ -66,6 +66,54 @@ CSV_FIELDS = [
     "matching_ms",
     "total_ms",
     "frame_total_ms",
+    "temporal_right_x",
+    "temporal_right_y",
+    "right_flow_fb_error_px",
+    "cycle_error_px",
+    "cycle_cost",
+    "cycle_status",
+    "texture_std",
+    "second_best_cost",
+    "uniqueness_margin_value",
+    "cost_curvature",
+    "icgn_status",
+    "icgn_converged",
+    "icgn_iterations",
+    "icgn_residual",
+    "icgn_hessian",
+    "icgn_cost_curvature",
+    "left_variance_px2",
+    "disparity_variance_px2",
+    "measurement_quality_score",
+    "kalman_innovation_u",
+    "kalman_innovation_v",
+    "kalman_innovation_d",
+    "kalman_innovation_norm",
+    "kalman_gain_disparity",
+    "kalman_nis",
+    "kalman_update_status",
+    "point_role",
+    "compensation_status",
+    "compensation_applied",
+    "compensation_inlier_count",
+    "compensation_reference_count",
+    "compensation_rmse_mm",
+    "camera_tx_mm",
+    "camera_ty_mm",
+    "camera_tz_mm",
+    "camera_rotation_angle_deg",
+    "compensated_X_m",
+    "compensated_Y_m",
+    "compensated_Z_m",
+    "final_X_m",
+    "final_Y_m",
+    "final_Z_m",
+    "raw_delta_X_mm",
+    "raw_delta_Y_mm",
+    "raw_delta_Z_mm",
+    "compensated_delta_X_mm",
+    "compensated_delta_Y_mm",
+    "compensated_delta_Z_mm",
 ]
 
 
@@ -184,30 +232,68 @@ def run_ablation_suite(
             )
     calibration = load_calibration(calibration_value)
     base = config or MatcherConfig()
-    variants = {
-        "full": base,
-        "full_no_flow": replace(base, enable_flow=False),
-        "full_no_prediction": replace(base, enable_prediction=False),
-        "full_no_epipolar": replace(base, enable_epipolar=False),
-        "full_no_neighborhood": replace(base, enable_neighborhood=False),
-        "full_no_subpixel": replace(base, enable_subpixel=False),
-        "full_no_lr": replace(base, enable_lr_check=False),
-        "full_no_pyramid": replace(base, enable_pyramid=False),
-        "full_no_recovery": replace(base, enable_recovery=False),
-        "full_no_temporal_estimation": replace(base, enable_temporal_estimation=False),
+    variants: dict[str, tuple[MethodName, MatcherConfig]] = {
+        "full": ("full_quality", base),
+        "full_no_flow": ("full_quality", replace(base, enable_flow=False)),
+        "full_no_prediction": ("full_quality", replace(base, enable_prediction=False)),
+        "full_no_epipolar": ("full_quality", replace(base, enable_epipolar=False)),
+        "full_no_neighborhood": ("full_quality", replace(base, enable_neighborhood=False)),
+        "full_no_subpixel": ("full_quality", replace(base, enable_subpixel=False)),
+        "full_no_lr": ("full_quality", replace(base, enable_lr_check=False)),
+        "full_no_pyramid": ("full_quality", replace(base, enable_pyramid=False)),
+        "full_no_recovery": ("full_quality", replace(base, enable_recovery=False)),
+        "full_no_temporal_estimation": (
+            "full_quality",
+            replace(base, enable_temporal_estimation=False),
+        ),
+        "research_full": ("research_full", base),
+        "research_no_cycle": (
+            "research_full",
+            replace(base, enable_cycle_consistency=False),
+        ),
+        "research_no_icgn": ("research_full", replace(base, enable_icgn=False)),
+        "research_no_adaptive_filter": (
+            "research_full",
+            replace(base, enable_adaptive_filter=False),
+        ),
+        "research_no_camera_compensation": (
+            "research_full",
+            replace(base, enable_camera_compensation=False),
+        ),
+        "research_cycle_only": (
+            "research_full",
+            replace(
+                base,
+                enable_icgn=False,
+                enable_adaptive_filter=False,
+                enable_camera_compensation=False,
+            ),
+        ),
+        "research_cycle_icgn": (
+            "research_full",
+            replace(
+                base,
+                enable_adaptive_filter=False,
+                enable_camera_compensation=False,
+            ),
+        ),
+        "research_cycle_icgn_filter": (
+            "research_full",
+            replace(base, enable_camera_compensation=False),
+        ),
     }
     results_root = manifest.output_dir or manifest.points_path.parent / "results"
     output_dir = results_root / "ablations"
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, Path] = {}
-    for label, variant_config in variants.items():
+    for label, (engine_method, variant_config) in variants.items():
         rows: list[dict[str, object]] = []
         for repeat_index in range(repeats):
             variant_rows = _run_method_once(
                 manifest,
                 calibration,
                 variant_config,
-                "full_quality",
+                engine_method,
                 repeat_index,
                 warmup_frames,
             )
@@ -222,8 +308,11 @@ def run_ablation_suite(
         outputs[label] = output_path
     metadata = {
         "sequence": manifest.name,
-        "engine_method": "full_quality",
-        "variants": {label: asdict(value) for label, value in variants.items()},
+        "engine_method": "full_quality/research_full",
+        "variants": {
+            label: {"engine_method": method, "config": asdict(value)}
+            for label, (method, value) in variants.items()
+        },
         "repeats": repeats,
         "warmup_frames": warmup_frames,
         "generated_at": datetime.now(timezone.utc).isoformat(),

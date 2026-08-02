@@ -304,3 +304,46 @@ def test_static_stability_does_not_mix_absolute_positions_of_different_points() 
 
     assert summary["x_std_mm"] == 0.0
     assert summary["peak_to_peak_x_mm"] == 0.0
+
+
+def test_research_quality_metrics_are_reported_from_raw_fields() -> None:
+    rows = []
+    for frame, values in enumerate(
+        (
+            (0.2, "cycle_valid", "valid", 2, 0.03, 8.0, 8.0, True),
+            (0.8, "cycle_soft", "valid", 4, 0.08, 8.2, 8.1, True),
+            (2.0, "cycle_recovered", "icgn_not_converged", 6, 0.20, 7.8, 7.95, False),
+        )
+    ):
+        cycle_error, cycle_status, icgn_status, iterations, residual, measured, estimated, applied = values
+        row = _prediction(frame)
+        row.update(
+            {
+                "method": "research_full",
+                "cycle_error_px": cycle_error,
+                "cycle_status": cycle_status,
+                "icgn_status": icgn_status,
+                "icgn_iterations": iterations,
+                "icgn_residual": residual,
+                "measured_disparity": measured,
+                "estimated_disparity": estimated,
+                "compensation_applied": applied,
+                "point_role": "reference",
+                "raw_delta_X_mm": float(frame * 2),
+                "compensated_delta_X_mm": float(frame) if applied else "",
+            }
+        )
+        rows.append(row)
+    rows.append({**_prediction(3, status="cycle_failed"), "cycle_status": "cycle_failed"})
+
+    summary = evaluate_rows(rows)
+
+    assert summary["cycle_sample_count"] == 3
+    assert summary["cycle_failure_count"] == 1
+    assert summary["cycle_recovery_count"] == 1
+    assert summary["cycle_error_median_px"] == 0.8
+    assert summary["icgn_attempt_count"] == 3
+    assert summary["icgn_success_count"] == 2
+    assert math.isclose(summary["icgn_success_rate_pct"], 200.0 / 3.0)
+    assert summary["measured_disparity_std_px"] > summary["estimated_disparity_std_px"]
+    assert math.isclose(summary["camera_compensation_success_rate_pct"], 200.0 / 3.0)

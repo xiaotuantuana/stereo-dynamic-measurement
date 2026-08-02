@@ -269,6 +269,140 @@ def _write_plots(
     _bar_plot(plt, save, summaries, "false_match_rate_pct", "False matches (%)", "false_match_comparison", colors)
     _bar_plot(plt, save, summaries, "recovery_success_rate_pct", "Recovery success (%)", "recovery_comparison", colors)
 
+    for field, ylabel, title, filename in (
+        ("cycle_error_px", "Cycle error (px)", "Four-view cycle consistency", "cycle_error_over_time"),
+        ("disparity_variance_px2", r"$\sigma_d^2$ (px$^2$)", "Adaptive disparity measurement variance", "kalman_measurement_variance"),
+        ("kalman_gain_disparity", "Disparity gain", "Adaptive Kalman disparity gain", "kalman_gain_over_time"),
+    ):
+        figure, axis = plt.subplots(figsize=(6.75, 2.8))
+        plotted = False
+        for method_index, (method, rows) in enumerate(rows_by_method.items()):
+            values = [
+                (int(row["frame"]), value)
+                for row in rows
+                if str(row.get("repeat", "0")) == "0"
+                and (value := _float_or_none(row.get(field))) is not None
+            ]
+            if values:
+                values.sort()
+                axis.plot(
+                    [item[0] for item in values],
+                    [item[1] for item in values],
+                    label=method,
+                    color=colors[method_index % len(colors)],
+                    linewidth=1.2,
+                )
+                plotted = True
+        axis.set_xlabel("Frame")
+        axis.set_ylabel(ylabel)
+        axis.set_title(title)
+        if plotted:
+            axis.legend()
+        else:
+            axis.text(0.5, 0.5, "No applicable data", ha="center", va="center", transform=axis.transAxes)
+        save(figure, filename)
+
+    figure, axis = plt.subplots(figsize=(6.75, 2.8))
+    plotted = False
+    for method_index, (method, rows) in enumerate(rows_by_method.items()):
+        point_rows = [
+            row for row in rows
+            if str(row.get("repeat", "0")) == "0" and row.get("status") == "valid"
+        ]
+        point_rows.sort(key=lambda row: int(row.get("frame", 0)))
+        frames = [int(row["frame"]) for row in point_rows]
+        measured = [_float_or_none(row.get("measured_disparity")) for row in point_rows]
+        estimated = [_float_or_none(row.get("estimated_disparity")) for row in point_rows]
+        if frames and all(value is not None for value in measured + estimated):
+            color = colors[method_index % len(colors)]
+            axis.plot(frames, measured, color=color, alpha=0.4, label=f"{method} measured")
+            axis.plot(frames, estimated, color=color, linestyle="--", label=f"{method} filtered")
+            plotted = True
+    axis.set_xlabel("Frame")
+    axis.set_ylabel("Disparity (px)")
+    axis.set_title("Measured vs. adaptive-filtered disparity")
+    if plotted:
+        axis.legend(ncol=2)
+    else:
+        axis.text(0.5, 0.5, "No paired disparity data", ha="center", va="center", transform=axis.transAxes)
+    save(figure, "measured_vs_filtered_disparity")
+
+    figure, axis = plt.subplots(figsize=(6.75, 2.8))
+    plotted = False
+    for method_index, (method, rows) in enumerate(rows_by_method.items()):
+        valid = [row for row in rows if str(row.get("repeat", "0")) == "0" and row.get("status") == "valid"]
+        frames = [int(row["frame"]) for row in valid]
+        raw = [_float_or_none(row.get("raw_delta_Z_mm")) for row in valid]
+        compensated = [_float_or_none(row.get("compensated_delta_Z_mm")) for row in valid]
+        color = colors[method_index % len(colors)]
+        if frames and all(value is not None for value in raw):
+            axis.plot(frames, raw, color=color, alpha=0.4, label=f"{method} raw")
+            plotted = True
+        if frames and all(value is not None for value in compensated):
+            axis.plot(frames, compensated, color=color, linestyle="--", label=f"{method} compensated")
+            plotted = True
+    axis.set_xlabel("Frame")
+    axis.set_ylabel(r"$\Delta Z$ (mm)")
+    axis.set_title("Camera compensation before and after")
+    if plotted:
+        axis.legend(ncol=2)
+    else:
+        axis.text(0.5, 0.5, "No compensation data", ha="center", va="center", transform=axis.transAxes)
+    save(figure, "camera_compensation_before_after")
+
+    figure, axis = plt.subplots(figsize=(6.75, 2.8))
+    plotted = False
+    for method_index, (method, rows) in enumerate(rows_by_method.items()):
+        values: list[tuple[int, float]] = []
+        for row in rows:
+            if str(row.get("repeat", "0")) != "0" or str(row.get("point_role")) != "reference":
+                continue
+            vector = [_float_or_none(row.get(f"compensated_delta_{axis_name}_mm")) for axis_name in ("X", "Y", "Z")]
+            if all(value is not None for value in vector):
+                values.append((int(row["frame"]), float(np.linalg.norm(vector))))
+        if values:
+            values.sort()
+            axis.plot([item[0] for item in values], [item[1] for item in values], label=method, color=colors[method_index % len(colors)])
+            plotted = True
+    axis.set_xlabel("Frame")
+    axis.set_ylabel("Reference residual (mm)")
+    axis.set_title("Static reference residual after compensation")
+    if plotted:
+        axis.legend()
+    else:
+        axis.text(0.5, 0.5, "No reference compensation data", ha="center", va="center", transform=axis.transAxes)
+    save(figure, "reference_compensation_residual")
+
+    _bar_plot(plt, save, summaries, "icgn_disparity_rmse_px", "IC-GN disparity RMSE (px)", "ablation_disparity_rmse", colors)
+    _bar_plot(plt, save, summaries, "estimated_xyz_rmse_mm", "Estimated 3D RMSE (mm)", "ablation_3d_rmse", colors)
+    _bar_plot(plt, save, summaries, "jump_rate_pct", "Jump rate (%)", "ablation_jump_rate", colors)
+    _bar_plot(plt, save, summaries, "effective_tracking_rate_pct", "Effective tracking (%)", "ablation_tracking_rate", colors)
+    _bar_plot(plt, save, summaries, "runtime_median_ms", "Median runtime (ms)", "ablation_runtime", colors)
+    figure, axis = plt.subplots(figsize=(7.2, 3.0))
+    method_names = list(summaries)
+    x_positions = np.arange(len(method_names), dtype=float)
+    metric_specs = (
+        ("integer_disparity_rmse_px", "integer"),
+        ("subpixel_disparity_rmse_px", "original subpixel"),
+        ("icgn_disparity_rmse_px", "IC-GN"),
+    )
+    width = 0.24
+    for metric_index, (metric, label) in enumerate(metric_specs):
+        values = [summaries[method].get(metric) for method in method_names]
+        numeric = [0.0 if value is None else float(value) for value in values]
+        axis.bar(
+            x_positions + (metric_index - 1) * width,
+            numeric,
+            width=width,
+            label=label,
+            color=colors[metric_index % len(colors)],
+        )
+    axis.set_xticks(x_positions, method_names, rotation=20)
+    axis.set_ylabel("Disparity RMSE (px)")
+    axis.set_title("Integer, original subpixel, and IC-GN comparison")
+    axis.legend()
+    save(figure, "integer_subpixel_icgn_comparison")
+
     gt_map = {
         (int(row["frame"]), str(row["point_id"])): row
         for row in ground_truth

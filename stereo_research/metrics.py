@@ -224,7 +224,205 @@ def evaluate_rows(
         _percent(recovery_successes, recovery_attempts) if recovery_attempts else None
     )
     summary["mean_recovery_frames"] = _mean_recovery_frames(rows)
+    summary.update(_research_quality_metrics(rows, valid_rows, gt_by_key, gt_by_point))
     return summary
+
+
+def _research_quality_metrics(
+    rows: list[dict[str, Any]],
+    valid_rows: list[dict[str, Any]],
+    gt_by_key: dict[tuple[int, str], dict[str, Any]],
+    gt_by_point: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    cycle_errors = [
+        value for row in rows if (value := _as_float(row.get("cycle_error_px"))) is not None
+    ]
+    cycle_failures = sum(
+        str(row.get("status")) == "cycle_failed"
+        or str(row.get("cycle_status")) == "cycle_failed"
+        for row in rows
+    )
+    cycle_recoveries = sum(
+        str(row.get("cycle_status")) == "cycle_recovered" for row in rows
+    )
+    cycle_denominator = len(cycle_errors) + cycle_failures
+    icgn_rows = [
+        row
+        for row in rows
+        if str(row.get("icgn_status", "")) not in {"", "not_attempted"}
+    ]
+    icgn_successes = sum(str(row.get("icgn_status")) == "valid" for row in icgn_rows)
+    icgn_iterations = [
+        value
+        for row in icgn_rows
+        if (value := _as_float(row.get("icgn_iterations"))) is not None
+    ]
+    icgn_residuals = [
+        value
+        for row in icgn_rows
+        if (value := _as_float(row.get("icgn_residual"))) is not None
+    ]
+    measured_disparities = [
+        value
+        for row in valid_rows
+        if (value := _as_float(row.get("measured_disparity"))) is not None
+    ]
+    estimated_disparities = [
+        value
+        for row in valid_rows
+        if (value := _as_float(row.get("estimated_disparity"))) is not None
+    ]
+    integer_errors: list[float] = []
+    subpixel_errors: list[float] = []
+    icgn_errors: list[float] = []
+    measured_xyz_errors: list[float] = []
+    estimated_xyz_errors: list[float] = []
+    amplitude_ratios: list[float] = []
+    amplitude_groups: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    for row in valid_rows:
+        gt = _lookup_ground_truth(row, gt_by_key, gt_by_point)
+        if gt is None:
+            continue
+        truth_disparity = _as_float(gt.get("gt_disparity"))
+        if truth_disparity is None:
+            truth_pixels = _pixel_truth(gt)
+            truth_disparity = None if truth_pixels is None else truth_pixels[0] - truth_pixels[2]
+        if truth_disparity is not None:
+            integer_value = _as_float(row.get("integer_disparity"))
+            subpixel_value = _as_float(row.get("measured_disparity"))
+            estimated_value = _as_float(row.get("estimated_disparity"))
+            if integer_value is not None:
+                integer_errors.append(integer_value - truth_disparity)
+            if subpixel_value is not None:
+                subpixel_errors.append(subpixel_value - truth_disparity)
+            if str(row.get("icgn_status")) == "valid" and subpixel_value is not None:
+                icgn_errors.append(subpixel_value - truth_disparity)
+            if estimated_value is not None:
+                amplitude_groups[
+                    (str(row.get("repeat", "0")), str(row.get("point_id")))
+                ].append((truth_disparity, estimated_value))
+        truth_xyz = _xyz(gt)
+        if truth_xyz is not None:
+            measured_xyz = _xyz_from_prefix(row, "measured_")
+            estimated_xyz = _xyz_from_prefix(row, "estimated_")
+            if measured_xyz is not None:
+                measured_xyz_errors.append(float(np.linalg.norm(measured_xyz - truth_xyz) * 1000.0))
+            if estimated_xyz is not None:
+                estimated_xyz_errors.append(float(np.linalg.norm(estimated_xyz - truth_xyz) * 1000.0))
+    for pairs in amplitude_groups.values():
+        if len(pairs) < 3:
+            continue
+        truth = np.asarray([pair[0] for pair in pairs], dtype=np.float64)
+        estimate = np.asarray([pair[1] for pair in pairs], dtype=np.float64)
+        truth_amplitude = 0.5 * float(np.ptp(truth))
+        if truth_amplitude > 1e-12:
+            amplitude_ratios.append(0.5 * float(np.ptp(estimate)) / truth_amplitude)
+
+    compensated_valid = [
+        row for row in valid_rows if _as_bool(row.get("compensation_applied"))
+    ]
+    reference_residuals: list[float] = []
+    raw_static_values: list[float] = []
+    compensated_static_values: list[float] = []
+    for row in valid_rows:
+        if str(row.get("point_role", "measurement")) != "reference":
+            continue
+        raw = _delta_vector(row, "raw_delta_")
+        compensated = _delta_vector(row, "compensated_delta_")
+        if raw is not None:
+            raw_static_values.append(float(np.linalg.norm(raw)))
+        if compensated is not None:
+            residual = float(np.linalg.norm(compensated))
+            compensated_static_values.append(residual)
+            reference_residuals.append(residual)
+    raw_drifts, compensated_drifts = _camera_drift_values(valid_rows)
+    return {
+        "cycle_sample_count": len(cycle_errors),
+        "cycle_error_mean_px": float(np.mean(cycle_errors)) if cycle_errors else None,
+        "cycle_error_median_px": float(np.median(cycle_errors)) if cycle_errors else None,
+        "cycle_error_p95_px": float(np.percentile(cycle_errors, 95)) if cycle_errors else None,
+        "cycle_failure_count": cycle_failures,
+        "cycle_failure_rate_pct": _percent(cycle_failures, cycle_denominator),
+        "cycle_recovery_count": cycle_recoveries,
+        "icgn_attempt_count": len(icgn_rows),
+        "icgn_success_count": icgn_successes,
+        "icgn_success_rate_pct": _percent(icgn_successes, len(icgn_rows)),
+        "icgn_iteration_mean": float(np.mean(icgn_iterations)) if icgn_iterations else None,
+        "icgn_residual_mean": float(np.mean(icgn_residuals)) if icgn_residuals else None,
+        "integer_disparity_rmse_px": _rmse(integer_errors),
+        "subpixel_disparity_rmse_px": _rmse(subpixel_errors),
+        "icgn_disparity_rmse_px": _rmse(icgn_errors),
+        "measured_disparity_std_px": float(np.std(measured_disparities)) if measured_disparities else None,
+        "estimated_disparity_std_px": float(np.std(estimated_disparities)) if estimated_disparities else None,
+        "measured_xyz_rmse_mm": _rmse(measured_xyz_errors),
+        "estimated_xyz_rmse_mm": _rmse(estimated_xyz_errors),
+        "measured_innovation_rmse_mm": _series_innovation_rmse(valid_rows, "measured_"),
+        "estimated_innovation_rmse_mm": _series_innovation_rmse(valid_rows, "estimated_"),
+        "amplitude_ratio": float(np.mean(amplitude_ratios)) if amplitude_ratios else None,
+        "camera_compensation_success_rate_pct": _percent(len(compensated_valid), len(valid_rows)),
+        "camera_reference_residual_mean_mm": float(np.mean(reference_residuals)) if reference_residuals else None,
+        "camera_reference_residual_p95_mm": float(np.percentile(reference_residuals, 95)) if reference_residuals else None,
+        "raw_static_point_std_mm": float(np.std(raw_static_values)) if raw_static_values else None,
+        "compensated_static_point_std_mm": float(np.std(compensated_static_values)) if compensated_static_values else None,
+        "raw_drift_mm": float(np.mean(raw_drifts)) if raw_drifts else None,
+        "compensated_drift_mm": float(np.mean(compensated_drifts)) if compensated_drifts else None,
+    }
+
+
+def _xyz_from_prefix(row: dict[str, Any], prefix: str) -> np.ndarray | None:
+    values = [_as_float(row.get(f"{prefix}{axis}_m")) for axis in ("X", "Y", "Z")]
+    if any(value is None for value in values):
+        return None
+    return np.asarray(values, dtype=np.float64)
+
+
+def _delta_vector(row: dict[str, Any], prefix: str) -> np.ndarray | None:
+    values = [_as_float(row.get(f"{prefix}{axis}_mm")) for axis in ("X", "Y", "Z")]
+    if any(value is None for value in values):
+        return None
+    return np.asarray(values, dtype=np.float64)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _series_innovation_rmse(rows: list[dict[str, Any]], prefix: str) -> float | None:
+    grouped: dict[tuple[str, str], list[tuple[int, np.ndarray]]] = defaultdict(list)
+    for row in rows:
+        xyz = _xyz_from_prefix(row, prefix)
+        if xyz is not None:
+            grouped[(str(row.get("repeat", "0")), str(row.get("point_id")))].append(
+                (_as_int(row.get("frame")), xyz)
+            )
+    residuals: list[float] = []
+    for values in grouped.values():
+        values.sort(key=lambda item: item[0])
+        for first, second, third in zip(values, values[1:], values[2:]):
+            if second[0] - first[0] == 1 and third[0] - second[0] == 1:
+                residuals.append(float(np.linalg.norm(third[1] - (2 * second[1] - first[1])) * 1000.0))
+    return _rmse(residuals)
+
+
+def _camera_drift_values(rows: list[dict[str, Any]]) -> tuple[list[float], list[float]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if str(row.get("point_role", "measurement")) == "reference":
+            grouped[(str(row.get("repeat", "0")), str(row.get("point_id")))].append(row)
+    raw: list[float] = []
+    compensated: list[float] = []
+    for values in grouped.values():
+        values.sort(key=lambda row: _as_int(row.get("frame")))
+        if len(values) < 2:
+            continue
+        for prefix, target in (("raw_delta_", raw), ("compensated_delta_", compensated)):
+            first = _delta_vector(values[0], prefix)
+            last = _delta_vector(values[-1], prefix)
+            if first is not None and last is not None:
+                target.append(float(np.linalg.norm(last - first)))
+    return raw, compensated
 
 
 def _relative_displacement_metrics(

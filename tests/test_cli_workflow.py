@@ -331,6 +331,14 @@ def test_ablation_suite_keeps_each_full_method_deletion_separate(tmp_path: Path)
         "full_no_pyramid",
         "full_no_recovery",
         "full_no_temporal_estimation",
+        "research_full",
+        "research_no_cycle",
+        "research_no_icgn",
+        "research_no_adaptive_filter",
+        "research_no_camera_compensation",
+        "research_cycle_only",
+        "research_cycle_icgn",
+        "research_cycle_icgn_filter",
     }
     with outputs["full_no_lr"].open(newline="", encoding="utf-8-sig") as handle:
         row = next(csv.DictReader(handle))

@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 import cv2
 import numpy as np
 
+from .icgn import ICGNResult, refine_disparity_icgn
 from .models import MatcherConfig, MethodProfile
 
 
@@ -25,6 +26,20 @@ class LocalMatchResult:
     estimated_right_xy: tuple[float, float] | None = None
     subpixel_offset: float | None = None
     quality_stage: str = "primary"
+    second_best_cost: float | None = None
+    uniqueness_margin_value: float | None = None
+    texture_std: float | None = None
+    cost_curvature: float | None = None
+    temporal_right_xy: tuple[float, float] | None = None
+    cycle_error_px: float | None = None
+    right_flow_fb_error_px: float | None = None
+    cycle_cost: float | None = None
+    icgn_status: str = "not_attempted"
+    icgn_converged: bool = False
+    icgn_iterations: int = 0
+    icgn_residual: float | None = None
+    icgn_hessian: float | None = None
+    icgn_cost_curvature: float | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +48,7 @@ class _Candidate:
     vertical_offset: int
     photo_cost: float
     total_cost: float
+    cycle_cost: float = 0.0
 
 
 def predict_disparity(
@@ -84,17 +100,27 @@ class LocalMatcher:
         predicted_disparity: float,
         profile: MethodProfile,
         latest_disparity: float | None = None,
+        temporal_right_xy: tuple[float, float] | None = None,
+        right_flow_fb_error_px: float | None = None,
     ) -> LocalMatchResult:
         self._validate_images(left_gray, right_gray)
         left_patch = self._extract_patch(left_gray, left_xy)
         if left_patch is None:
             return LocalMatchResult(status="out_of_bounds")
-        if float(np.std(left_patch)) < self.config.min_texture_std:
+        texture_std = float(np.std(left_patch))
+        if texture_std < self.config.min_texture_std:
             return LocalMatchResult(status="low_texture")
 
         use_prediction = profile.use_prediction and self.config.enable_prediction
         use_epipolar = profile.use_epipolar and self.config.enable_epipolar
         use_neighborhood = profile.use_neighborhood and self.config.enable_neighborhood
+        use_cycle = (
+            profile.use_cycle_consistency
+            and self.config.enable_cycle_consistency
+            and temporal_right_xy is not None
+            and right_flow_fb_error_px is not None
+            and right_flow_fb_error_px <= self.config.right_flow_fb_threshold
+        )
         neighbor_disparity = (
             self._neighborhood_disparity(left_gray, right_gray, left_xy, predicted_disparity)
             if use_neighborhood
@@ -110,6 +136,7 @@ class LocalMatcher:
             use_prediction,
             use_epipolar,
             neighbor_disparity,
+            temporal_right_xy if use_cycle else None,
         )
         if not first:
             first = self._search(
@@ -121,6 +148,7 @@ class LocalMatcher:
                 use_prediction,
                 use_epipolar,
                 neighbor_disparity,
+                temporal_right_xy if use_cycle else None,
             )
         elif self._best_on_horizontal_boundary(first, predicted_disparity, self.config.search_radius):
             expanded = self._search(
@@ -132,6 +160,7 @@ class LocalMatcher:
                 use_prediction,
                 use_epipolar,
                 neighbor_disparity,
+                temporal_right_xy if use_cycle else None,
             )
             if expanded:
                 first = expanded
@@ -146,6 +175,9 @@ class LocalMatcher:
                 cost=best.total_cost,
                 used_search_radius=self._search_radius(first, predicted_disparity),
                 neighbor_disparity=neighbor_disparity,
+                texture_std=texture_std,
+                temporal_right_xy=temporal_right_xy,
+                right_flow_fb_error_px=right_flow_fb_error_px,
             )
         alternatives = [
             item
@@ -161,20 +193,92 @@ class LocalMatcher:
                 cost=best.total_cost,
                 used_search_radius=self._search_radius(first, predicted_disparity),
                 neighbor_disparity=neighbor_disparity,
+                second_best_cost=second_cost,
+                uniqueness_margin_value=margin,
+                texture_std=texture_std,
+                temporal_right_xy=temporal_right_xy,
+                right_flow_fb_error_px=right_flow_fb_error_px,
             )
 
         disparity = float(best.disparity)
+        icgn_result: ICGNResult | None = None
+        icgn_output_status = "not_attempted"
+        quality_stage = "primary"
         if profile.use_subpixel and self.config.enable_subpixel:
-            disparity += self._subpixel_offset(
-                left_patch,
-                right_gray,
-                left_xy,
-                best.disparity,
-                best.vertical_offset,
+            subpixel_method = (
+                self.config.research_subpixel_method
+                if profile.use_icgn and self.config.enable_icgn
+                else self.config.subpixel_method
             )
+            if subpixel_method == "icgn":
+                icgn_result = refine_disparity_icgn(
+                    left_gray,
+                    right_gray,
+                    left_xy,
+                    float(best.disparity),
+                    float(best.vertical_offset),
+                    self.config.icgn_patch_size,
+                    self.config.icgn_max_iterations,
+                    self.config.icgn_epsilon,
+                    self.config.icgn_max_offset_px,
+                )
+                icgn_output_status = icgn_result.status
+                if (
+                    icgn_result.status == "valid"
+                    and icgn_result.hessian is not None
+                    and icgn_result.hessian < self.config.icgn_min_hessian
+                ):
+                    icgn_output_status = "icgn_low_hessian"
+                elif (
+                    icgn_result.status == "valid"
+                    and icgn_result.residual_rms is not None
+                    and icgn_result.residual_rms > self.config.icgn_max_residual
+                ):
+                    icgn_output_status = "icgn_residual_exceeded"
+                if (
+                    icgn_output_status == "valid"
+                    and icgn_result.refined_disparity is not None
+                    and icgn_result.hessian is not None
+                    and icgn_result.hessian >= self.config.icgn_min_hessian
+                    and icgn_result.residual_rms is not None
+                    and icgn_result.residual_rms <= self.config.icgn_max_residual
+                ):
+                    disparity = float(icgn_result.refined_disparity)
+                    quality_stage += "_icgn"
+                elif self.config.icgn_fallback_method != "integer":
+                    disparity += self._subpixel_offset(
+                        left_patch,
+                        right_gray,
+                        left_xy,
+                        best.disparity,
+                        best.vertical_offset,
+                        method=self.config.icgn_fallback_method,
+                    )
+                    quality_stage += f"_icgn_fallback_{self.config.icgn_fallback_method}"
+                else:
+                    quality_stage += "_icgn_fallback_integer"
+            else:
+                disparity += self._subpixel_offset(
+                    left_patch,
+                    right_gray,
+                    left_xy,
+                    best.disparity,
+                    best.vertical_offset,
+                    method=subpixel_method,
+                )
         right_xy = (
             float(left_xy[0] - disparity),
             float(left_xy[1] + best.vertical_offset),
+        )
+        cycle_error = (
+            float(np.linalg.norm(np.asarray(right_xy) - np.asarray(temporal_right_xy)))
+            if use_cycle and temporal_right_xy is not None
+            else None
+        )
+        cycle_cost = (
+            float(min(cycle_error / self.config.cycle_hard_threshold_px, 1.0))
+            if cycle_error is not None
+            else None
         )
 
         lr_error: float | None = None
@@ -195,6 +299,19 @@ class LocalMatcher:
                     lr_error_px=lr_error,
                     used_search_radius=self._search_radius(first, predicted_disparity),
                     neighbor_disparity=neighbor_disparity,
+                    second_best_cost=second_cost,
+                    uniqueness_margin_value=margin,
+                    texture_std=texture_std,
+                    icgn_status=icgn_output_status,
+                    icgn_converged=(icgn_result.converged if icgn_result else False),
+                    icgn_iterations=(icgn_result.iterations if icgn_result else 0),
+                    icgn_residual=(icgn_result.residual_rms if icgn_result else None),
+                    icgn_hessian=(icgn_result.hessian if icgn_result else None),
+                    icgn_cost_curvature=(icgn_result.cost_curvature if icgn_result else None),
+                    temporal_right_xy=temporal_right_xy,
+                    cycle_error_px=cycle_error,
+                    right_flow_fb_error_px=right_flow_fb_error_px,
+                    cycle_cost=cycle_cost,
                 )
 
         confidence = float(
@@ -222,6 +339,21 @@ class LocalMatcher:
             estimated_disparity=disparity,
             estimated_right_xy=right_xy,
             subpixel_offset=float(disparity - best.disparity),
+            quality_stage=quality_stage,
+            second_best_cost=second_cost,
+            uniqueness_margin_value=margin,
+            texture_std=texture_std,
+            cost_curvature=(icgn_result.cost_curvature if icgn_result else None),
+            icgn_status=icgn_output_status,
+            icgn_converged=(icgn_result.converged if icgn_result else False),
+            icgn_iterations=(icgn_result.iterations if icgn_result else 0),
+            icgn_residual=(icgn_result.residual_rms if icgn_result else None),
+            icgn_hessian=(icgn_result.hessian if icgn_result else None),
+            icgn_cost_curvature=(icgn_result.cost_curvature if icgn_result else None),
+            temporal_right_xy=temporal_right_xy,
+            cycle_error_px=cycle_error,
+            right_flow_fb_error_px=right_flow_fb_error_px,
+            cycle_cost=cycle_cost,
         )
 
     def _search(
@@ -234,6 +366,7 @@ class LocalMatcher:
         use_prediction: bool,
         use_epipolar: bool,
         neighbor_disparity: float | None,
+        temporal_right_xy: tuple[float, float] | None = None,
     ) -> list[_Candidate]:
         center = int(round(predicted_disparity))
         candidates: list[_Candidate] = []
@@ -262,6 +395,15 @@ class LocalMatcher:
                     )
                 else:
                     neighborhood = 0.0
+                cycle_cost = (
+                    min(
+                        float(np.linalg.norm(np.asarray(right_xy) - np.asarray(temporal_right_xy)))
+                        / self.config.cycle_hard_threshold_px,
+                        1.0,
+                    )
+                    if temporal_right_xy is not None
+                    else 0.0
+                )
                 terms = [(self.config.photo_weight, photo)]
                 if use_prediction:
                     terms.append((self.config.prediction_weight, temporal))
@@ -269,6 +411,8 @@ class LocalMatcher:
                     terms.append((self.config.epipolar_weight, epipolar))
                 if neighbor_disparity is not None:
                     terms.append((self.config.neighborhood_weight, neighborhood))
+                if temporal_right_xy is not None:
+                    terms.append((self.config.cycle_weight, cycle_cost))
                 total = normalized_constraint_cost(terms)
                 candidates.append(
                     _Candidate(
@@ -276,6 +420,7 @@ class LocalMatcher:
                         vertical_offset=vertical_offset,
                         photo_cost=photo,
                         total_cost=float(total),
+                        cycle_cost=float(cycle_cost),
                     )
                 )
         return candidates
@@ -350,8 +495,10 @@ class LocalMatcher:
         left_xy: tuple[float, float],
         disparity: int,
         vertical_offset: int,
+        method: str | None = None,
     ) -> float:
-        if self.config.subpixel_method == "continuous":
+        selected_method = self.config.subpixel_method if method is None else method
+        if selected_method == "continuous":
             return self._continuous_subpixel_offset(
                 left_patch,
                 right_gray,
@@ -359,6 +506,8 @@ class LocalMatcher:
                 disparity,
                 vertical_offset,
             )
+        if selected_method == "integer":
+            return 0.0
         costs: list[float] = []
         for candidate in (disparity - 1, disparity, disparity + 1):
             patch = self._extract_patch(
@@ -528,6 +677,8 @@ class QualityLocalMatcher:
         predicted_disparity: float,
         profile: MethodProfile,
         latest_disparity: float | None = None,
+        temporal_right_xy: tuple[float, float] | None = None,
+        right_flow_fb_error_px: float | None = None,
     ) -> LocalMatchResult:
         primary = self.primary.match(
             left_gray,
@@ -535,11 +686,18 @@ class QualityLocalMatcher:
             left_xy,
             predicted_disparity,
             profile,
+            latest_disparity=latest_disparity,
+            temporal_right_xy=temporal_right_xy,
+            right_flow_fb_error_px=right_flow_fb_error_px,
         )
         if primary.status == "valid":
             result = replace(
                 primary,
-                quality_stage="primary",
+                quality_stage=(
+                    primary.quality_stage
+                    if primary.quality_stage != "primary"
+                    else "primary"
+                ),
             )
         else:
             context = self.context.match(
@@ -548,6 +706,9 @@ class QualityLocalMatcher:
                 left_xy,
                 predicted_disparity,
                 profile,
+                latest_disparity=latest_disparity,
+                temporal_right_xy=temporal_right_xy,
+                right_flow_fb_error_px=right_flow_fb_error_px,
             )
             if context.status == "valid":
                 result = replace(context, quality_stage="context_recovery")
@@ -566,6 +727,9 @@ class QualityLocalMatcher:
                     left_xy,
                     pyramid_disparity,
                     profile,
+                    latest_disparity=latest_disparity,
+                    temporal_right_xy=temporal_right_xy,
+                    right_flow_fb_error_px=right_flow_fb_error_px,
                 )
                 if recovered.status != "valid":
                     return primary
@@ -616,6 +780,9 @@ class QualityLocalMatcher:
                     left_xy,
                     predicted_disparity,
                     profile,
+                    latest_disparity=latest_disparity,
+                    temporal_right_xy=temporal_right_xy,
+                    right_flow_fb_error_px=right_flow_fb_error_px,
                 )
                 verifier_disparity = (
                     verifier.measured_disparity

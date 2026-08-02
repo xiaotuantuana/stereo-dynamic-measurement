@@ -7,6 +7,9 @@ from typing import Iterable
 import cv2
 import numpy as np
 
+from .camera_compensation import apply_rigid_transform, estimate_camera_compensation
+from .cycle_consistency import evaluate_cycle_consistency
+from .filtering import AdaptivePointKalman
 from .geometry import reproject_point_m
 from .global_matching import GlobalSample, GlobalStereoMatcher, GlobalStereoResult
 from .local_matching import LocalMatcher, QualityLocalMatcher, predict_disparity
@@ -18,7 +21,8 @@ from .models import (
     PointState,
     method_profile,
 )
-from .tracking import track_point_lk
+from .tracking import track_point_lk, track_xy_lk
+from .uncertainty import estimate_match_uncertainty
 
 
 class TemporalStereoPipeline:
@@ -37,7 +41,7 @@ class TemporalStereoPipeline:
         self.global_matcher = GlobalStereoMatcher(self.config)
         self.local_matcher = (
             QualityLocalMatcher(self.config)
-            if method == "full_quality"
+            if method in {"full_quality", "research_full"}
             else LocalMatcher(self.config)
         )
         self.recovery_matcher = QualityLocalMatcher(
@@ -50,7 +54,10 @@ class TemporalStereoPipeline:
         )
         self.states: dict[str, PointState] = {}
         self.previous_left_gray: np.ndarray | None = None
+        self.previous_right_gray: np.ndarray | None = None
         self.flow_reference_gray: dict[str, np.ndarray] = {}
+        self.right_flow_reference_gray: dict[str, np.ndarray] = {}
+        self.filters: dict[str, AdaptivePointKalman] = {}
         self.initialized = False
 
     def initialize(
@@ -91,6 +98,7 @@ class TemporalStereoPipeline:
                 point_id=point.point_id,
                 initial_left_xy=point.xy,
                 left_xy=point.xy,
+                point_role=point.role,
             )
             self.states[point.point_id] = state
             self.flow_reference_gray[point.point_id] = left_gray.copy()
@@ -108,8 +116,7 @@ class TemporalStereoPipeline:
                     )
                 )
                 continue
-            results.append(
-                self._valid_result(
+            result = self._valid_result(
                     frame,
                     state,
                     sample.right_xy,
@@ -121,10 +128,13 @@ class TemporalStereoPipeline:
                     matching_ms=initialization_matching_ms,
                     total_ms=initialization_matching_ms,
                 )
-            )
+            results.append(result)
+            if result.status == "valid":
+                self.right_flow_reference_gray[point.point_id] = right_gray.copy()
         self.previous_left_gray = left_gray.copy()
+        self.previous_right_gray = right_gray.copy()
         self.initialized = True
-        return results
+        return self._apply_camera_compensation(results)
 
     def step(
         self,
@@ -146,7 +156,7 @@ class TemporalStereoPipeline:
             recovery_stage = ""
             if state.status == "lost":
                 can_attempt = (
-                    self.method == "full_quality"
+                    self.method in {"full_quality", "research_full"}
                     and self.config.enable_recovery
                     and frame % self.config.recovery_interval_frames == 0
                 )
@@ -171,7 +181,7 @@ class TemporalStereoPipeline:
                     state.recovery_started_frame = frame
             elif (
                 state.status == "recovering"
-                and self.method == "full_quality"
+                and self.method in {"full_quality", "research_full"}
                 and self.config.enable_recovery
             ):
                 recovery_attempt = True
@@ -182,6 +192,9 @@ class TemporalStereoPipeline:
 
             flow_ms = 0.0
             flow_error: float | None = None
+            temporal_right_xy: tuple[float, float] | None = None
+            right_flow_error: float | None = None
+            cycle_status = "not_used"
             if self.profile.use_flow and self.config.enable_flow:
                 flow_start = time.perf_counter()
                 flow = track_point_lk(
@@ -214,6 +227,29 @@ class TemporalStereoPipeline:
                 self.flow_reference_gray[state.point_id] = left_gray.copy()
             else:
                 state.left_xy = state.initial_left_xy
+
+            if (
+                self.profile.use_cycle_consistency
+                and self.config.enable_cycle_consistency
+                and state.right_xy is not None
+                and state.point_id in self.right_flow_reference_gray
+            ):
+                right_flow_start = time.perf_counter()
+                right_flow = track_xy_lk(
+                    self.right_flow_reference_gray[state.point_id],
+                    right_gray,
+                    previous_xy=state.right_flow_reference_xy or state.right_xy,
+                    initial_velocity=state.right_velocity,
+                    config=self.config,
+                    recovery=recovery_attempt,
+                    fb_threshold=self.config.right_flow_fb_threshold,
+                )
+                flow_ms += (time.perf_counter() - right_flow_start) * 1000.0
+                right_flow_error = right_flow.fb_error_px
+                if right_flow.status == "valid" and right_flow.left_xy is not None:
+                    temporal_right_xy = right_flow.left_xy
+                else:
+                    cycle_status = "right_flow_failed"
 
             if self.profile.dense_sgbm_each_frame:
                 assert dense_result is not None
@@ -278,8 +314,7 @@ class TemporalStereoPipeline:
                         and recovery_sample.disparity is not None
                         and recovery_sample.right_xy is not None
                     ):
-                        results.append(
-                            self._valid_result(
+                        recovered_result = self._valid_result(
                                 frame,
                                 state,
                                 recovery_sample.right_xy,
@@ -293,7 +328,9 @@ class TemporalStereoPipeline:
                                 flow_error,
                                 recovery_stage="sgbm_reinitialized",
                             )
-                        )
+                        results.append(recovered_result)
+                        if recovered_result.status == "valid":
+                            self.right_flow_reference_gray[state.point_id] = right_gray.copy()
                         continue
                 state.record_failure("ambiguous", self.config.max_failures)
                 results.append(
@@ -318,6 +355,10 @@ class TemporalStereoPipeline:
                 if self.profile.use_prediction and self.config.enable_prediction
                 else latest
             )
+            if temporal_right_xy is not None:
+                cycle_predicted = state.left_xy[0] - temporal_right_xy[0]
+                blend = self.config.cycle_prediction_blend
+                predicted = float((1.0 - blend) * predicted + blend * cycle_predicted)
             matching_start = time.perf_counter()
             matcher = self.recovery_matcher if recovery_attempt else self.local_matcher
             match = matcher.match(
@@ -327,6 +368,8 @@ class TemporalStereoPipeline:
                 predicted,
                 self.profile,
                 latest_disparity=latest,
+                temporal_right_xy=temporal_right_xy,
+                right_flow_fb_error_px=right_flow_error,
             )
             matching_ms = (time.perf_counter() - matching_start) * 1000.0
             if match.status != "valid" or match.disparity is None or match.right_xy is None:
@@ -345,6 +388,66 @@ class TemporalStereoPipeline:
                     )
                 )
                 continue
+            if temporal_right_xy is not None:
+                cycle_check = evaluate_cycle_consistency(
+                    match.right_xy,
+                    temporal_right_xy,
+                    self.config,
+                )
+                if cycle_check.should_recover:
+                    recovery_match = self.recovery_matcher.match(
+                        left_gray,
+                        right_gray,
+                        state.left_xy,
+                        state.left_xy[0] - temporal_right_xy[0],
+                        self.profile,
+                        latest_disparity=latest,
+                        temporal_right_xy=temporal_right_xy,
+                        right_flow_fb_error_px=right_flow_error,
+                    )
+                    matching_ms = (time.perf_counter() - matching_start) * 1000.0
+                    if recovery_match.status == "valid" and recovery_match.right_xy is not None:
+                        cycle_check = evaluate_cycle_consistency(
+                            match.right_xy,
+                            temporal_right_xy,
+                            self.config,
+                            recovered_right_xy=recovery_match.right_xy,
+                        )
+                        if cycle_check.status == "cycle_recovered":
+                            match = replace(
+                                recovery_match,
+                                cycle_error_px=cycle_check.error_px,
+                                cycle_cost=cycle_check.cost,
+                                quality_stage="cycle_recovered",
+                            )
+                cycle_status = cycle_check.status
+                if cycle_status == "cycle_failed":
+                    state.record_failure("cycle_failed", self.config.max_failures)
+                    results.append(
+                        FramePointResult.invalid(
+                            self.method,
+                            frame,
+                            state,
+                            "lost" if state.status == "lost" else "cycle_failed",
+                            flow_ms=flow_ms,
+                            matching_ms=matching_ms,
+                            total_ms=(time.perf_counter() - point_start) * 1000.0,
+                            flow_fb_error_px=flow_error,
+                            recovery_stage=recovery_stage,
+                            temporal_right_xy=temporal_right_xy,
+                            right_flow_fb_error_px=right_flow_error,
+                            cycle_error_px=cycle_check.error_px,
+                            cycle_cost=cycle_check.cost,
+                            cycle_status="cycle_failed",
+                        )
+                    )
+                    continue
+                match = replace(
+                    match,
+                    confidence=match.confidence * cycle_check.confidence_scale,
+                    cycle_error_px=cycle_check.error_px,
+                    cycle_cost=cycle_check.cost,
+                )
             results.append(
                 self._valid_result(
                     frame,
@@ -368,10 +471,170 @@ class TemporalStereoPipeline:
                     used_search_radius=match.used_search_radius,
                     quality_stage=match.quality_stage,
                     recovery_stage="recaptured" if recovery_attempt else recovery_stage,
+                    temporal_right_xy=temporal_right_xy,
+                    right_flow_fb_error_px=right_flow_error,
+                    cycle_error_px=match.cycle_error_px,
+                    cycle_cost=match.cycle_cost,
+                    cycle_status=cycle_status,
+                    texture_std=match.texture_std,
+                    second_best_cost=match.second_best_cost,
+                    uniqueness_margin_value=match.uniqueness_margin_value,
+                    cost_curvature=match.cost_curvature,
+                    icgn_status=match.icgn_status,
+                    icgn_converged=match.icgn_converged,
+                    icgn_iterations=match.icgn_iterations,
+                    icgn_residual=match.icgn_residual,
+                    icgn_hessian=match.icgn_hessian,
+                    icgn_cost_curvature=match.icgn_cost_curvature,
                 )
             )
+            if results[-1].status == "valid" and temporal_right_xy is not None:
+                state.last_cycle_error_px = match.cycle_error_px
+                state.last_right_flow_fb_error_px = right_flow_error
+                self.right_flow_reference_gray[state.point_id] = right_gray.copy()
         self.previous_left_gray = left_gray.copy()
-        return results
+        self.previous_right_gray = right_gray.copy()
+        return self._apply_camera_compensation(results)
+
+    def _apply_camera_compensation(
+        self,
+        results: list[FramePointResult],
+    ) -> list[FramePointResult]:
+        if not (
+            self.profile.use_camera_compensation
+            and self.config.enable_camera_compensation
+        ):
+            return results
+        reference_results: list[FramePointResult] = []
+        current_points: list[tuple[float, float, float]] = []
+        initial_points: list[tuple[float, float, float]] = []
+        weights: list[float] = []
+        for result in results:
+            state = self.states[result.point_id]
+            current = (result.estimated_x_m, result.estimated_y_m, result.estimated_z_m)
+            if (
+                result.status != "valid"
+                or state.point_role != "reference"
+                or state.reference_estimated_xyz is None
+                or any(value is None for value in current)
+            ):
+                continue
+            current_array = np.asarray(current, dtype=np.float64)
+            if not np.isfinite(current_array).all():
+                continue
+            reference_results.append(result)
+            current_points.append(tuple(float(value) for value in current_array))
+            initial_points.append(state.reference_estimated_xyz)
+            variance = state.last_disparity_variance_px2 or 1.0
+            weights.append(max(state.confidence, 1e-3) / max(variance, 1e-9))
+        if current_points:
+            compensation = estimate_camera_compensation(
+                np.asarray(current_points, dtype=np.float64),
+                np.asarray(initial_points, dtype=np.float64),
+                tuple(result.point_id for result in reference_results),
+                np.asarray(weights, dtype=np.float64),
+                self.config,
+            )
+        else:
+            compensation = estimate_camera_compensation(
+                np.empty((0, 3), dtype=np.float64),
+                np.empty((0, 3), dtype=np.float64),
+                (),
+                None,
+                self.config,
+            )
+        reference_count = len(reference_results)
+        applied = (
+            compensation.status == "valid"
+            and compensation.rotation is not None
+            and compensation.translation_m is not None
+        )
+        if applied:
+            assert compensation.rotation is not None
+            assert compensation.translation_m is not None
+            rotation_angle = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip((np.trace(compensation.rotation) - 1.0) * 0.5, -1.0, 1.0)
+                    )
+                )
+            )
+            translation_mm = compensation.translation_m * 1000.0
+        else:
+            rotation_angle = None
+            translation_mm = np.asarray([None, None, None], dtype=object)
+
+        processed: list[FramePointResult] = []
+        for result in results:
+            state = self.states[result.point_id]
+            estimated_values = (result.estimated_x_m, result.estimated_y_m, result.estimated_z_m)
+            if result.status != "valid" or any(value is None for value in estimated_values):
+                processed.append(
+                    replace(
+                        result,
+                        compensation_status=compensation.status,
+                        compensation_applied=False,
+                        compensation_inlier_count=len(compensation.inlier_ids),
+                        compensation_reference_count=reference_count,
+                        compensation_rmse_mm=compensation.residual_rmse_mm,
+                    )
+                )
+                continue
+            estimated_xyz = np.asarray(estimated_values, dtype=np.float64)
+            reference_xyz = np.asarray(
+                state.reference_compensated_xyz
+                or state.reference_estimated_xyz
+                or tuple(estimated_xyz),
+                dtype=np.float64,
+            )
+            raw_delta = (estimated_xyz - reference_xyz) * 1000.0
+            final_xyz = estimated_xyz
+            compensated_xyz: np.ndarray | None = None
+            if applied:
+                compensated_xyz = apply_rigid_transform(
+                    estimated_xyz.reshape(1, 3),
+                    compensation.rotation,
+                    compensation.translation_m,
+                )[0]
+                final_xyz = compensated_xyz
+            state.compensated_xyz = tuple(float(value) for value in final_xyz)
+            if state.reference_compensated_xyz is None:
+                state.reference_compensated_xyz = tuple(
+                    state.reference_estimated_xyz
+                    or tuple(float(value) for value in final_xyz)
+                )
+                reference_xyz = np.asarray(state.reference_compensated_xyz, dtype=np.float64)
+            final_delta = (final_xyz - reference_xyz) * 1000.0
+            processed.append(
+                replace(
+                    result,
+                    compensation_status=compensation.status,
+                    compensation_applied=applied,
+                    compensation_inlier_count=len(compensation.inlier_ids),
+                    compensation_reference_count=reference_count,
+                    compensation_rmse_mm=compensation.residual_rmse_mm,
+                    camera_tx_mm=translation_mm[0],
+                    camera_ty_mm=translation_mm[1],
+                    camera_tz_mm=translation_mm[2],
+                    camera_rotation_angle_deg=rotation_angle,
+                    compensated_x_m=(float(compensated_xyz[0]) if compensated_xyz is not None else None),
+                    compensated_y_m=(float(compensated_xyz[1]) if compensated_xyz is not None else None),
+                    compensated_z_m=(float(compensated_xyz[2]) if compensated_xyz is not None else None),
+                    final_x_m=float(final_xyz[0]),
+                    final_y_m=float(final_xyz[1]),
+                    final_z_m=float(final_xyz[2]),
+                    raw_delta_x_mm=float(raw_delta[0]),
+                    raw_delta_y_mm=float(raw_delta[1]),
+                    raw_delta_z_mm=float(raw_delta[2]),
+                    compensated_delta_x_mm=(float(final_delta[0]) if applied else None),
+                    compensated_delta_y_mm=(float(final_delta[1]) if applied else None),
+                    compensated_delta_z_mm=(float(final_delta[2]) if applied else None),
+                    delta_x_mm=float(final_delta[0]),
+                    delta_y_mm=float(final_delta[1]),
+                    delta_z_mm=float(final_delta[2]),
+                )
+            )
+        return processed
 
     def _valid_result(
         self,
@@ -396,6 +659,21 @@ class TemporalStereoPipeline:
         used_search_radius: int = 0,
         quality_stage: str = "",
         recovery_stage: str = "",
+        temporal_right_xy: tuple[float, float] | None = None,
+        right_flow_fb_error_px: float | None = None,
+        cycle_error_px: float | None = None,
+        cycle_cost: float | None = None,
+        cycle_status: str = "not_used",
+        texture_std: float | None = None,
+        second_best_cost: float | None = None,
+        uniqueness_margin_value: float | None = None,
+        cost_curvature: float | None = None,
+        icgn_status: str = "not_attempted",
+        icgn_converged: bool = False,
+        icgn_iterations: int = 0,
+        icgn_residual: float | None = None,
+        icgn_hessian: float | None = None,
+        icgn_cost_curvature: float | None = None,
     ) -> FramePointResult:
         measured = float(
             measured_disparity
@@ -455,8 +733,69 @@ class TemporalStereoPipeline:
             )
 
         estimated = measured
+        estimated_left_xy = state.left_xy
+        left_variance_px2: float | None = None
+        disparity_variance_px2: float | None = None
+        measurement_quality_score: float | None = None
+        kalman_innovation = (None, None, None)
+        kalman_innovation_norm: float | None = None
+        kalman_gain_disparity: float | None = None
+        kalman_nis: float | None = None
+        kalman_update_status = "not_used"
+        kalman_recovery_needed = False
         latest_valid = state.disparity
         if (
+            self.profile.use_adaptive_filter
+            and self.config.enable_adaptive_filter
+        ):
+            uncertainty = estimate_match_uncertainty(
+                texture_std=texture_std,
+                photo_cost=match_cost,
+                uniqueness_margin=uniqueness_margin_value,
+                cost_curvature=cost_curvature,
+                flow_fb_error_px=flow_error,
+                right_flow_fb_error_px=right_flow_fb_error_px,
+                lr_error_px=lr_error,
+                cycle_error_px=cycle_error_px,
+                icgn_residual=icgn_residual,
+                icgn_hessian=icgn_hessian,
+                config=self.config,
+            )
+            left_variance_px2 = uncertainty.left_position_variance_px2
+            disparity_variance_px2 = uncertainty.disparity_variance_px2
+            measurement_quality_score = uncertainty.quality_score
+            point_filter = self.filters.get(state.point_id)
+            if point_filter is None:
+                point_filter = AdaptivePointKalman(self.config)
+                point_filter.initialize(state.left_xy, measured)
+                self.filters[state.point_id] = point_filter
+                kalman_update_status = "initialized"
+            else:
+                point_filter.predict()
+                update = point_filter.update(
+                    state.left_xy,
+                    measured,
+                    left_variance_px2,
+                    disparity_variance_px2,
+                )
+                estimated_left_xy = update.estimated_left_xy
+                estimated = update.estimated_disparity
+                kalman_innovation = update.innovation
+                kalman_innovation_norm = update.innovation_norm
+                kalman_gain_disparity = update.kalman_gain_disparity
+                kalman_nis = update.nis
+                kalman_update_status = update.status
+                kalman_recovery_needed = (
+                    update.status == "predict_only_outlier"
+                    and point_filter.predict_only_frames
+                    >= self.config.kalman_max_predict_only_frames
+                )
+                state.last_kalman_innovation = update.innovation_norm
+                state.last_kalman_gain_disparity = update.kalman_gain_disparity
+                state.last_nis = update.nis
+            state.last_left_variance_px2 = left_variance_px2
+            state.last_disparity_variance_px2 = disparity_variance_px2
+        elif (
             self.method == "full_quality"
             and self.config.enable_temporal_estimation
             and latest_valid is not None
@@ -474,13 +813,13 @@ class TemporalStereoPipeline:
                 else "temporal_stabilized"
             )
         estimated_right = (
-            float(state.left_xy[0] - estimated),
-            float(right_xy[1]),
+            float(estimated_left_xy[0] - estimated),
+            float(estimated_left_xy[1] + (right_xy[1] - state.left_xy[1])),
         )
         try:
             estimated_xyz_array = reproject_point_m(
-                state.left_xy[0],
-                state.left_xy[1],
+                estimated_left_xy[0],
+                estimated_left_xy[1],
                 estimated,
                 self.q,
                 self.calibration_unit,
@@ -501,7 +840,7 @@ class TemporalStereoPipeline:
         measured_xyz = tuple(float(value) for value in measured_xyz_array)
         estimated_xyz = tuple(float(value) for value in estimated_xyz_array)
         was_recovering = (
-            self.method == "full_quality"
+            self.method in {"full_quality", "research_full"}
             and self.config.enable_recovery
             and state.status in {"recovering", "lost"}
         )
@@ -514,6 +853,10 @@ class TemporalStereoPipeline:
             estimated_xyz=estimated_xyz,
         )
         state.confirm_valid(confidence)
+        if kalman_recovery_needed:
+            state.status = "recovering"
+            if state.recovery_started_frame is None:
+                state.recovery_started_frame = frame
         if was_recovering:
             state.confirm_recovery(frame)
         reference = state.reference_estimated_xyz or estimated_xyz
@@ -571,6 +914,39 @@ class TemporalStereoPipeline:
             flow_ms=flow_ms,
             matching_ms=matching_ms,
             total_ms=total_ms,
+            temporal_right_x=(temporal_right_xy[0] if temporal_right_xy else None),
+            temporal_right_y=(temporal_right_xy[1] if temporal_right_xy else None),
+            right_flow_fb_error_px=right_flow_fb_error_px,
+            cycle_error_px=cycle_error_px,
+            cycle_cost=cycle_cost,
+            cycle_status=cycle_status,
+            texture_std=texture_std,
+            second_best_cost=second_best_cost,
+            uniqueness_margin_value=uniqueness_margin_value,
+            cost_curvature=cost_curvature,
+            icgn_status=icgn_status,
+            icgn_converged=icgn_converged,
+            icgn_iterations=icgn_iterations,
+            icgn_residual=icgn_residual,
+            icgn_hessian=icgn_hessian,
+            icgn_cost_curvature=icgn_cost_curvature,
+            point_role=state.point_role,
+            final_x_m=estimated_xyz[0],
+            final_y_m=estimated_xyz[1],
+            final_z_m=estimated_xyz[2],
+            raw_delta_x_mm=delta_mm[0],
+            raw_delta_y_mm=delta_mm[1],
+            raw_delta_z_mm=delta_mm[2],
+            left_variance_px2=left_variance_px2,
+            disparity_variance_px2=disparity_variance_px2,
+            measurement_quality_score=measurement_quality_score,
+            kalman_innovation_u=kalman_innovation[0],
+            kalman_innovation_v=kalman_innovation[1],
+            kalman_innovation_d=kalman_innovation[2],
+            kalman_innovation_norm=kalman_innovation_norm,
+            kalman_gain_disparity=kalman_gain_disparity,
+            kalman_nis=kalman_nis,
+            kalman_update_status=kalman_update_status,
         )
 
     @staticmethod

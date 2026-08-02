@@ -1,6 +1,9 @@
 # 时空预测驱动的局部双目匹配研究代码
 
-该目录对应论文的核心创新实验，和现有 Tkinter 深度相机程序相互独立。程序在校正后的多个人工测点上比较 `sgbm_fixed`、`sgbm_flow`、`local_fixed`、`local_flow`、`full` 和 `full_quality`。旧名称 `sgbm`、`local` 分别作为前两种固定左点方法的兼容别名。
+论文升级版完整方法为 `research_full`。新增四视图闭环、IC-GN、自适应卡尔曼和静态参考点
+相机补偿的说明与运行命令见 [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md)。
+
+该目录对应论文的核心创新实验，和现有 Tkinter 深度相机程序相互独立。程序在校正后的多个人工测点上比较 `sgbm_fixed`、`sgbm_flow`、`local_fixed`、`local_flow`、`full`、`full_quality` 和 `research_full`。旧名称 `sgbm`、`local` 分别作为前两种固定左点方法的兼容别名。
 
 ## 环境
 
