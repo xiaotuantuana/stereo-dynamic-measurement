@@ -32,7 +32,7 @@ python -m pytest -q
 python run_simulation.py --config configs/simulation.yaml
 ```
 
-输出默认写到 `configs/outputs/simulation`；可在 YAML 中调整 60–300 mm 基线、焦距、内收角外参、
+输出默认写到 `outputs/simulation`；可在 YAML 中调整 60–300 mm 基线、焦距、内收角外参、
 分辨率、两类像点噪声、帧率及轨迹参数。
 
 运行时固定 OpenCV 单线程。CSV 中 `frame_total_ms` 是去除视频读取、显示和写文件后的整帧算法耗时；`flow_ms`、`matching_ms` 和 `total_ms` 是点级诊断耗时。

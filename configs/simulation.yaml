@@ -17,4 +17,4 @@ simulation:
 structure:
   trajectory_kind: impact_decay
   frequency_hz: 2.0
-output_dir: outputs/simulation
+output_dir: ../outputs/simulation

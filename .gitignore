@@ -8,6 +8,7 @@ __pycache__/
 htmlcov/
 
 # Runtime and experiment outputs
+outputs/
 stereo_app_outputs/
 stereo_point_cloud_outputs/
 experiments/**/results/
