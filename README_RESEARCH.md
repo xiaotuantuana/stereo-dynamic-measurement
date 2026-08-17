@@ -22,6 +22,19 @@ python -m pip install -r requirements_research.txt
 python -m pytest -q
 ```
 
+## 动态三维位移仿真（任务 1）
+
+新的 `stereo_dynamic_measurement` 包严格使用 mm、s、rad 和 pixel。它不会修改既有
+`stereo_research` 流程。运行下面命令可生成 P1–P4 的正弦/多频/冲击衰减真值、含噪左右像点、
+三角化重建结果、逐轴误差、三维 RMSE 与两张图：
+
+```powershell
+python run_simulation.py --config configs/simulation.yaml
+```
+
+输出默认写到 `configs/outputs/simulation`；可在 YAML 中调整 60–300 mm 基线、焦距、内收角外参、
+分辨率、两类像点噪声、帧率及轨迹参数。
+
 运行时固定 OpenCV 单线程。CSV 中 `frame_total_ms` 是去除视频读取、显示和写文件后的整帧算法耗时；`flow_ms`、`matching_ms` 和 `total_ms` 是点级诊断耗时。
 
 ## 1. 选择第一帧测点
