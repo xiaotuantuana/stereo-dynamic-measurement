@@ -14,31 +14,31 @@ Add a mm-native camera model and deterministic stereo simulation package beside 
 
 ### Phase 1: Foundation
 
-- [ ] Task 1: Add package layout, typed calibration model, loaders, and DLT triangulation.
-- [ ] Task 2: Add unit tests for all calibration formats and zero-noise reconstruction.
+- [x] Task 1: Add package layout, typed calibration model, loaders, and DLT triangulation.
+- [x] Task 2: Add unit tests for all calibration formats and zero-noise reconstruction.
 
 ### Checkpoint: Foundation
 
-- [ ] Focused calibration tests pass.
+- [x] Focused calibration tests pass.
 
 ### Phase 2: Dynamic synthetic data
 
-- [ ] Task 3: Add three trajectory classes and four-point structural configuration.
-- [ ] Task 4: Add stereo projection, noise injection, dataset export, and error metrics.
-- [ ] Task 5: Add tests for trajectories, point constraints, noise reporting, and an end-to-end dataset.
+- [x] Task 3: Add three trajectory classes and four-point structural configuration.
+- [x] Task 4: Add stereo projection, noise injection, dataset export, and error metrics.
+- [x] Task 5: Add tests for trajectories, point constraints, noise reporting, and an end-to-end dataset.
 
 ### Checkpoint: Simulation
 
-- [ ] Simulation tests pass and output schema is inspected.
+- [x] Simulation tests pass and output schema is inspected.
 
 ### Phase 3: Usability
 
-- [ ] Task 6: Add YAML configuration, one-command runner, visualizations, requirements, and usage documentation.
-- [ ] Task 7: Run the complete test suite and a manual simulation smoke test.
+- [x] Task 6: Add YAML configuration, one-command runner, visualizations, requirements, and usage documentation.
+- [x] Task 7: Run the task-1 test suite and a manual simulation smoke test.
 
 ### Checkpoint: Complete
 
-- [ ] All task-1 acceptance criteria pass without modifying existing `stereo_research` files.
+- [x] All task-1 acceptance criteria pass without modifying existing `stereo_research` files.
 
 ## Risks and Mitigations
 
