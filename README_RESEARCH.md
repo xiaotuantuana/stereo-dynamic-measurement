@@ -44,6 +44,15 @@ python run_innovation1_experiment.py --config configs/innovation1_experiment.yam
 该命令扫描 7 种基线、5 个距离和 4 个视差噪声，输出 `outputs/innovation1/baseline-distance-error.csv`
 及 `baseline_distance_rmse.png`。
 
+## 创新点二物理可信度验证
+
+```powershell
+python run_innovation2_validation.py --config configs/innovation2_validation.yaml
+```
+
+该验证生成四测点 5 Hz 相位结构，在 P3 注入跳变，并输出 `raw_vs_corrected.csv`、
+`physics_confidence.csv`、轨迹校正图和 PSD 对比图。
+
 运行时固定 OpenCV 单线程。CSV 中 `frame_total_ms` 是去除视频读取、显示和写文件后的整帧算法耗时；`flow_ms`、`matching_ms` 和 `total_ms` 是点级诊断耗时。
 
 ## 1. 选择第一帧测点
