@@ -12,7 +12,7 @@ def _measurement(*, lr_residual: float) -> MeasurementResult:
         frame_id=2, timestamp=0.2, point_id="P1", left_xy=(100.0, 100.0), right_xy=(90.0, 100.0),
         disparity_raw=10.0, disparity_subpixel=10.0, xyz_raw=np.array([0.0, 0.0, 2_000.0]),
         gradient_score=0.9, texture_score=0.9, blur_score=0.9, lr_residual=lr_residual,
-        neighbor_residual=1.5, measurement_confidence=0.3,
+        neighbor_residual=lr_residual, measurement_confidence=0.3,
     )
 
 

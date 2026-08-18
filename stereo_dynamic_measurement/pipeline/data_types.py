@@ -41,6 +41,7 @@ class MeasurementResult:
     matching_cost: float = 0.0
     neighbor_residual: float = 0.0
     temporal_residual: float = 0.0
+    tracking_loss_residual: float = 0.0
     measurement_confidence: float = 0.0
 
     def __post_init__(self) -> None:
@@ -49,6 +50,8 @@ class MeasurementResult:
         object.__setattr__(self, "xyz_raw", _xyz(self.xyz_raw))
         for name in ("gradient_score", "texture_score", "blur_score", "measurement_confidence"):
             _unit_interval(name, getattr(self, name))
+        if not np.isfinite(self.tracking_loss_residual) or self.tracking_loss_residual < 0:
+            raise ValueError("tracking_loss_residual must be finite and non-negative")
 
 
 @dataclass(frozen=True)

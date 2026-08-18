@@ -9,6 +9,7 @@ class FaultType(str, Enum):
 class Diagnosis: fault_type: FaultType; score: float; evidence: tuple[str,...]
 class RuleDiagnosticEngine:
     def diagnose(self, f: FaultFingerprint) -> Diagnosis:
+        if f.tracking_loss_residual > .8: return Diagnosis(FaultType.TRACKING_LOSS,.95,("tracking_loss",))
         if f.reference_motion_residual > 1 and f.common_target_motion_ratio > .7: return Diagnosis(FaultType.CAMERA_MOTION,.95,("reference_motion","common_target_motion"))
         if f.epipolar_residual > 1 or f.geometry_health_residual > .6: return Diagnosis(FaultType.EXTRINSIC_DRIFT,.9,("epipolar","geometry_health"))
         if f.lr_residual > 1 and f.neighbor_residual > 1 and f.reference_motion_residual < 1: return Diagnosis(FaultType.STEREO_MISMATCH,.9,("lr","neighbor"))

@@ -36,7 +36,7 @@ class StereoMeasurementOrchestrator:
         self.recovery_manager = recovery_manager or RecoveryManager()
 
     @staticmethod
-    def _fingerprint(measurement: MeasurementResult, physics: PhysicsValidationResult) -> FaultFingerprint:
+    def _fingerprint(measurement: MeasurementResult, physics: PhysicsValidationResult, *, reference_motion_residual: float, common_target_motion_ratio: float, geometry_health_residual: float) -> FaultFingerprint:
         return FaultFingerprint(
             gradient_quality=measurement.gradient_score,
             blur_score=measurement.blur_score,
@@ -48,6 +48,10 @@ class StereoMeasurementOrchestrator:
             fb_error=measurement.flow_fb_error,
             temporal_residual=measurement.temporal_residual,
             physics_residual=1.0 - physics.physics_confidence,
+            tracking_loss_residual=measurement.tracking_loss_residual,
+            reference_motion_residual=reference_motion_residual,
+            common_target_motion_ratio=common_target_motion_ratio,
+            geometry_health_residual=geometry_health_residual,
         )
 
     def process(
@@ -56,10 +60,16 @@ class StereoMeasurementOrchestrator:
         measurement: MeasurementResult,
         validate: Callable[[MeasurementResult], PhysicsValidationResult],
         remeasure: Callable[[RecoveryAction], MeasurementResult] | None = None,
+        reference_motion_residual: float = 0.0,
+        common_target_motion_ratio: float = 0.0,
+        geometry_health_residual: float = 0.0,
     ) -> OrchestratedFrameResult:
         """Validate one frame and, for a fault, execute and verify a remeasurement."""
         physics_before = validate(measurement)
-        fingerprint = self._fingerprint(measurement, physics_before)
+        fingerprint = self._fingerprint(
+            measurement, physics_before, reference_motion_residual=reference_motion_residual,
+            common_target_motion_ratio=common_target_motion_ratio, geometry_health_residual=geometry_health_residual,
+        )
         fault = self.diagnostic_engine.diagnose(fingerprint)
         plan = self.recovery_manager.plan(fault.fault_type)
         action = RecoveryAction(plan.action, dict(plan.parameter_updates))
@@ -67,8 +77,16 @@ class StereoMeasurementOrchestrator:
         if fault.fault_type.value != "NORMAL" and remeasure is not None:
             after_measurement = remeasure(action)
             after_physics = validate(after_measurement)
-        residual_before = max(measurement.lr_residual, measurement.epipolar_residual, measurement.flow_fb_error)
-        residual_after = max(after_measurement.lr_residual, after_measurement.epipolar_residual, after_measurement.flow_fb_error)
+        residual_before = max(
+            measurement.lr_residual, measurement.epipolar_residual, measurement.flow_fb_error,
+            measurement.matching_cost, measurement.neighbor_residual, measurement.temporal_residual,
+            measurement.tracking_loss_residual,
+        )
+        residual_after = max(
+            after_measurement.lr_residual, after_measurement.epipolar_residual, after_measurement.flow_fb_error,
+            after_measurement.matching_cost, after_measurement.neighbor_residual, after_measurement.temporal_residual,
+            after_measurement.tracking_loss_residual,
+        )
         verification = verify_recovery(
             c_phy_before=physics_before.physics_confidence,
             c_phy_after=after_physics.physics_confidence,

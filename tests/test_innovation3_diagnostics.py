@@ -18,6 +18,12 @@ def test_rule_engine_explains_stereo_mismatch_and_camera_motion() -> None:
     assert mismatch.evidence and camera.evidence
 
 
+def test_rule_engine_distinguishes_tracking_loss_from_short_occlusion() -> None:
+    result = RuleDiagnosticEngine().diagnose(FaultFingerprint(tracking_loss_residual=1.0))
+
+    assert result.fault_type is FaultType.TRACKING_LOSS
+
+
 def test_geometry_health_uses_vertical_disparity_statistics() -> None:
     result = geometry_health(np.array([0.1, -0.1, 0.2, 0.0]), np.array([0.0, 0.2, -0.1, 0.1]))
     drift = geometry_health(np.array([3.0, 2.0, 4.0, 3.0]), np.zeros(4))
