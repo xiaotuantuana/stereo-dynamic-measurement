@@ -23,10 +23,10 @@ class LocalStereoMatcher:
             raise ValueError("patch_size must be odd >= 3 and gradient_weight in [0, 1]")
         self.patch_size, self.gradient_weight = patch_size, gradient_weight
 
-    def match(self, left_gray: np.ndarray, right_gray: np.ndarray, *, left_point: tuple[float, float], predicted_disparity_px: float, search_radius_px: int) -> LocalMatchResult:
+    def match(self, left_gray: np.ndarray, right_gray: np.ndarray, *, left_point: tuple[float, float], predicted_disparity_px: float, search_radius_px: int, direction: int = 1) -> LocalMatchResult:
         if left_gray.ndim != 2 or right_gray.ndim != 2 or left_gray.shape != right_gray.shape:
             raise ValueError("Local stereo matching requires equally sized grayscale frames")
-        if search_radius_px < 1:
+        if search_radius_px < 1 or direction not in {-1, 1}:
             raise ValueError("search_radius_px must be positive")
         radius = self.patch_size // 2
         x, y = left_point
@@ -38,7 +38,7 @@ class LocalStereoMatcher:
         candidates = range(max(1, center - search_radius_px), center + search_radius_px + 1)
         curve: dict[float, float] = {}
         for disparity in candidates:
-            right_x = x - disparity
+            right_x = x - direction * disparity
             if right_x < radius or right_x >= right_gray.shape[1] - radius:
                 continue
             right_patch = cv2.getRectSubPix(right_gray, (self.patch_size, self.patch_size), (right_x, y)).astype(np.float32)
