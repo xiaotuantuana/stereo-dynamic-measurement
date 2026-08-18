@@ -48,3 +48,19 @@ def test_synthetic_dataset_exports_errors_and_summary_in_mm(tmp_path) -> None:
     summary = json.loads(paths["summary_json"].read_text(encoding="utf-8"))
     assert summary["unit"] == "mm"
     assert summary["sample_count"] == 24
+
+
+def test_zero_noise_dataset_reports_absolute_and_displacement_metrics() -> None:
+    dataset = generate_synthetic_dataset(SimulationConfig(camera=_camera(), duration_s=0.2, fps=10.0, random_seed=3))
+
+    for metric in (
+        "absolute_x_rmse_mm", "absolute_y_rmse_mm", "absolute_z_rmse_mm",
+        "absolute_3d_rmse_mm", "displacement_x_rmse_mm", "displacement_y_rmse_mm",
+        "displacement_z_rmse_mm", "displacement_3d_rmse_mm",
+        "peak_displacement_error_mm", "peak_displacement_error_percent",
+        "theoretical_depth_sigma_mm",
+    ):
+        assert metric in dataset.summary
+    assert dataset.summary["absolute_3d_rmse_mm"] < 1e-6
+    assert dataset.summary["displacement_3d_rmse_mm"] < 1e-6
+    assert dataset.summary["theoretical_depth_sigma_mm"] == 0.0

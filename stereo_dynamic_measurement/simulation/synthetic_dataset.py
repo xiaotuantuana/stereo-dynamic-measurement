@@ -34,6 +34,39 @@ class SyntheticDataset:
     summary: dict[str, float | int | str]
 
 
+def _rmse(values: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(values))))
+
+
+def _add_displacement_metrics(result: pd.DataFrame) -> dict[str, float]:
+    estimated_columns = ["X_estimated_mm", "Y_estimated_mm", "Z_estimated_mm"]
+    truth_columns = ["X_gt_mm", "Y_gt_mm", "Z_gt_mm"]
+    estimated = result[estimated_columns].to_numpy(dtype=np.float64)
+    truth = result[truth_columns].to_numpy(dtype=np.float64)
+    displacement_error = np.empty_like(estimated)
+    estimated_displacement = np.empty_like(estimated)
+    truth_displacement = np.empty_like(truth)
+    for _, indices in result.groupby("point_id", sort=False).indices.items():
+        index = np.asarray(indices, dtype=int)
+        estimated_displacement[index] = estimated[index] - estimated[index[0]]
+        truth_displacement[index] = truth[index] - truth[index[0]]
+        displacement_error[index] = estimated_displacement[index] - truth_displacement[index]
+    for axis, name in enumerate(("x", "y", "z")):
+        result[f"displacement_error_{name}_mm"] = displacement_error[:, axis]
+    result["displacement_error_3d_mm"] = np.linalg.norm(displacement_error, axis=1)
+    true_peak = float(np.max(np.linalg.norm(truth_displacement, axis=1)))
+    estimated_peak = float(np.max(np.linalg.norm(estimated_displacement, axis=1)))
+    peak_error = abs(estimated_peak - true_peak)
+    return {
+        "displacement_x_rmse_mm": _rmse(displacement_error[:, 0]),
+        "displacement_y_rmse_mm": _rmse(displacement_error[:, 1]),
+        "displacement_z_rmse_mm": _rmse(displacement_error[:, 2]),
+        "displacement_3d_rmse_mm": _rmse(np.linalg.norm(displacement_error, axis=1)),
+        "peak_displacement_error_mm": peak_error,
+        "peak_displacement_error_percent": 0.0 if true_peak == 0 else 100.0 * peak_error / true_peak,
+    }
+
+
 def generate_synthetic_dataset(config: SimulationConfig) -> SyntheticDataset:
     frame_count = int(round(config.duration_s * config.fps)) + 1
     time_s = np.linspace(0.0, config.duration_s, frame_count)
@@ -58,16 +91,23 @@ def generate_synthetic_dataset(config: SimulationConfig) -> SyntheticDataset:
     result["error_y_mm"] = errors[:, 1]
     result["error_z_mm"] = errors[:, 2]
     error_3d = np.linalg.norm(errors, axis=1)
-    rmse_3d = float(np.sqrt(np.mean(np.square(error_3d))))
+    rmse_3d = _rmse(error_3d)
     result["rmse_3d_mm"] = rmse_3d
+    displacement_metrics = _add_displacement_metrics(result)
+    point_noise_std = float(np.hypot(config.image_noise_std_px, config.localization_noise_std_px))
+    disparity_noise_std = float(np.sqrt(2.0) * point_noise_std)
+    depth_sigma = xyz_gt[:, 2] ** 2 * disparity_noise_std / (config.camera.K_left[0, 0] * config.camera.baseline_mm)
     summary: dict[str, float | int | str] = {
         "unit": "mm", "sample_count": len(result), "frame_count": frame_count,
-        "rmse_3d_mm": rmse_3d, "error_x_rmse_mm": float(np.sqrt(np.mean(errors[:, 0] ** 2))),
-        "error_y_rmse_mm": float(np.sqrt(np.mean(errors[:, 1] ** 2))),
-        "error_z_rmse_mm": float(np.sqrt(np.mean(errors[:, 2] ** 2))),
+        "rmse_3d_mm": rmse_3d, "error_x_rmse_mm": _rmse(errors[:, 0]),
+        "error_y_rmse_mm": _rmse(errors[:, 1]), "error_z_rmse_mm": _rmse(errors[:, 2]),
+        "absolute_x_rmse_mm": _rmse(errors[:, 0]), "absolute_y_rmse_mm": _rmse(errors[:, 1]),
+        "absolute_z_rmse_mm": _rmse(errors[:, 2]), "absolute_3d_rmse_mm": rmse_3d,
+        "theoretical_depth_sigma_mm": _rmse(depth_sigma),
         "baseline_mm": config.camera.baseline_mm, "image_noise_std_px": config.image_noise_std_px,
         "localization_noise_std_px": config.localization_noise_std_px,
     }
+    summary.update(displacement_metrics)
     return SyntheticDataset(result, summary)
 
 
