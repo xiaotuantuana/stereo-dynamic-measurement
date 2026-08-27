@@ -48,6 +48,19 @@ def test_no_correction_feedback_loop() -> None:
     assert [item.frame for item in processor.trusted_history] == [0, 1, 3, 4]
 
 
+def test_return_to_trusted_prediction_recovers_even_if_legacy_evidence_still_flags_anomaly() -> None:
+    processor = EnhancedPointProcessor(max_authorized_correction_mm=100.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    processor.process(_observation(2, 80.0, confirmed_anomaly=True))
+
+    return_frame = processor.process(_observation(3, 0.0, confirmed_anomaly=True))
+
+    assert return_frame.state is I2State.RECOVERY
+    assert return_frame.correction_applied is False
+    assert return_frame.corrected_xyz_mm is None
+
+
 def test_raw_and_corrected_histories_never_drive_prediction() -> None:
     processor = EnhancedPointProcessor(max_authorized_correction_mm=100.0)
     processor.process(_observation(0, 0.0))

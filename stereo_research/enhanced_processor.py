@@ -64,6 +64,7 @@ class EnhancedPointProcessor:
         max_authorized_correction_mm: float = 100.0,
         recovery_confirmation_frames: int = 2,
         max_prediction_gap_s: float = 1.0,
+        recovery_consistency_mm: float = 10.0,
     ) -> None:
         if max_authorized_correction_mm <= 0:
             raise ValueError("max_authorized_correction_mm must be positive")
@@ -71,9 +72,12 @@ class EnhancedPointProcessor:
             raise ValueError("recovery_confirmation_frames must be at least two")
         if max_prediction_gap_s <= 0:
             raise ValueError("max_prediction_gap_s must be positive")
+        if recovery_consistency_mm <= 0:
+            raise ValueError("recovery_consistency_mm must be positive")
         self.max_authorized_correction_mm = float(max_authorized_correction_mm)
         self.recovery_confirmation_frames = int(recovery_confirmation_frames)
         self.max_prediction_gap_s = float(max_prediction_gap_s)
+        self.recovery_consistency_mm = float(recovery_consistency_mm)
         self.state = I2State.NORMAL
         self.raw_history: list[TimedObservation] = []
         self.corrected_history: list[XYZ | None] = []
@@ -99,9 +103,54 @@ class EnhancedPointProcessor:
                 "hard_failure",
             )
 
+        if (
+            self.state in {I2State.QUARANTINED, I2State.RECOVERY}
+            and prediction is not None
+            and self._distance(raw, prediction) <= self.recovery_consistency_mm
+        ):
+            return self._recover_clean_observation(observation, raw, prediction)
+
         if evidence.confirmed_anomaly:
             return self._confirmed_anomaly(observation, raw, prediction)
 
+        if self.state is I2State.QUARANTINED:
+            return self._recover_clean_observation(observation, raw, prediction)
+
+        if self.state is I2State.RECOVERY:
+            return self._recover_clean_observation(observation, raw, prediction)
+
+        if evidence.suspicious and not evidence.legitimate_motion:
+            self.state = I2State.SUSPECT
+            return self._record(
+                observation,
+                raw,
+                prediction,
+                None,
+                False,
+                False,
+                CandidateSafety.unavailable("suspicious_observation"),
+                "suspect",
+            )
+
+        self._commit_trusted(observation)
+        self.state = I2State.NORMAL
+        return self._record(
+            observation,
+            raw,
+            prediction,
+            None,
+            False,
+            True,
+            CandidateSafety.unavailable("no correction proposed"),
+            "legitimate_motion" if evidence.legitimate_motion else "normal",
+        )
+
+    def _recover_clean_observation(
+        self,
+        observation: TimedObservation,
+        raw: XYZ,
+        prediction: XYZ | None,
+    ) -> EnhancedStateOutcome:
         if self.state is I2State.QUARANTINED:
             self.state = I2State.RECOVERY
             self._recovery_observations = [observation]
@@ -144,32 +193,7 @@ class EnhancedPointProcessor:
                 CandidateSafety.unavailable("no correction proposed"),
                 "recovery_confirmed",
             )
-
-        if evidence.suspicious and not evidence.legitimate_motion:
-            self.state = I2State.SUSPECT
-            return self._record(
-                observation,
-                raw,
-                prediction,
-                None,
-                False,
-                False,
-                CandidateSafety.unavailable("suspicious_observation"),
-                "suspect",
-            )
-
-        self._commit_trusted(observation)
-        self.state = I2State.NORMAL
-        return self._record(
-            observation,
-            raw,
-            prediction,
-            None,
-            False,
-            True,
-            CandidateSafety.unavailable("no correction proposed"),
-            "legitimate_motion" if evidence.legitimate_motion else "normal",
-        )
+        raise AssertionError("recovery helper requires a recovery state")
 
     def _confirmed_anomaly(
         self,

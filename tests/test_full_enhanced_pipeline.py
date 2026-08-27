@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import cv2
 
 from stereo_research.final_arbitration import (
     CandidateSafety,
@@ -64,6 +65,14 @@ def _enhanced_result(frame: int, y_m: float, *, anomaly: bool = False) -> FrameP
         fault_class="STEREO_MISMATCH" if anomaly else "NORMAL",
         fault_confidence=0.2 if anomaly else 0.0,
     )
+
+
+def _textured_stereo(disparity: float = 8.0) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(4242)
+    left = cv2.GaussianBlur(rng.integers(0, 256, (140, 240), dtype=np.uint8), (3, 3), 0.5)
+    transform = np.array([[1.0, 0.0, -disparity], [0.0, 1.0, 0.0]], dtype=np.float32)
+    right = cv2.warpAffine(left, transform, (240, 140), borderMode=cv2.BORDER_REFLECT101)
+    return left, right
 
 
 def test_apply_final_decision_commits_corrected_values_and_audit_atomically() -> None:
@@ -156,3 +165,92 @@ def test_shadow_authority_keeps_baseline_final_while_recording_proposal() -> Non
     assert shadow.proposed_decision == "USE_CORRECTED"
     assert shadow.committed_decision == "ACCEPT_WITH_WARNING"
     assert shadow.write_committed is False
+
+
+def test_i3_structured_recommendation_does_not_mutate_measurement_result() -> None:
+    result = _enhanced_result(2, 0.080, anomaly=True)
+    before = result.as_csv_row()
+
+    recommendation = _pipeline()._structured_i3_recommendation(result, hard_failure=False)
+
+    assert recommendation.risk is I3Risk.WARNING
+    assert result.as_csv_row() == before
+
+
+def test_blocking_i3_recommendation_rejects_even_with_safe_i2_candidate() -> None:
+    pipeline = _pipeline()
+    pipeline._process_enhanced_results([_enhanced_result(0, 0.0)])
+    pipeline._process_enhanced_results([_enhanced_result(1, 0.0)])
+
+    blocked = pipeline._process_enhanced_results([
+        FramePointResult(
+            **{
+                **_enhanced_result(2, 0.080, anomaly=True).__dict__,
+                "fault_confidence": 0.95,
+            }
+        )
+    ])[0]
+
+    assert blocked.proposed_decision == "REJECT"
+    assert blocked.committed_decision == "REJECT"
+    assert blocked.final_valid is False
+    assert blocked.status == "rejected"
+
+
+def test_enhanced_exception_fallback_preserves_original_baseline_validity() -> None:
+    pipeline = _pipeline()
+    valid = _enhanced_result(0, 0.02)
+    invalid = _result(status="lost", final_x_m=None, final_y_m=None, final_z_m=None)
+
+    valid_fallback = pipeline._enhanced_fallback(valid, RuntimeError("boom"))
+    invalid_fallback = pipeline._enhanced_fallback(invalid, RuntimeError("boom"))
+
+    assert valid_fallback.final_xyz_m == valid.final_xyz_m
+    assert valid_fallback.final_valid is True
+    assert valid_fallback.committed_decision == "ACCEPT_WITH_WARNING"
+    assert invalid_fallback.final_xyz_m is None
+    assert invalid_fallback.final_valid is False
+    assert invalid_fallback.status == "lost"
+
+
+def test_full_enhanced_without_write_flag_matches_shadow_final_and_csv() -> None:
+    left, right = _textured_stereo()
+    q = np.array([[1, 0, 0, -120], [0, 1, 0, -70], [0, 0, 0, 100], [0, 0, 10, 0]], dtype=float)
+    shadow = TemporalStereoPipeline("M3", q, "m")
+    full_no_write = TemporalStereoPipeline(
+        "M3", q, "m", experiment_authority=ExperimentAuthority.full_experiment(write_enabled=False)
+    )
+
+    # Keep the same one-point I1 input; no GUI or production caller receives authority.
+    from stereo_research.models import PointSpec
+    shadow_result = shadow.initialize(left, right, (PointSpec("P1", (150.0, 70.0)),), frame=0)[0]
+    enhanced_result = full_no_write.initialize(left, right, (PointSpec("P1", (150.0, 70.0)),), frame=0)[0]
+
+    assert enhanced_result.status == shadow_result.status
+    assert enhanced_result.final_xyz_m == shadow_result.final_xyz_m
+    assert set(enhanced_result.as_csv_row()) == set(shadow_result.as_csv_row())
+    runtime_fields = {"flow_ms", "matching_ms", "total_ms"}
+    for field, value in shadow_result.as_csv_row().items():
+        if field not in runtime_fields:
+            assert enhanced_result.as_csv_row()[field] == value
+    assert enhanced_result.write_committed is False
+
+
+def test_full_enhanced_smoke_produces_i1_i2_i3_and_final_diagnostics_per_frame() -> None:
+    left, right = _textured_stereo()
+    q = np.array([[1, 0, 0, -120], [0, 1, 0, -70], [0, 0, 0, 100], [0, 0, 10, 0]], dtype=float)
+    pipeline = TemporalStereoPipeline(
+        "M3", q, "m", experiment_authority=ExperimentAuthority.full_experiment(write_enabled=True)
+    )
+    from stereo_research.models import PointSpec
+    points = (PointSpec("P1", (150.0, 70.0)),)
+
+    first = pipeline.initialize(left, right, points, frame=0)[0]
+    second = pipeline.step(left, right, frame=1)[0]
+
+    for result in (first, second):
+        assert result.i2_state
+        assert result.proposed_decision
+        assert result.committed_decision
+        assert result.result_source
+        assert result.final_valid is not None
