@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, cast
 
 
 MethodName = Literal[
+    "M0",
+    "M1",
+    "M2",
+    "M3",
+    "THESIS_FULL",
     "sgbm",
     "sgbm_fixed",
     "local",
@@ -19,6 +25,7 @@ MethodName = Literal[
     "research_full",
 ]
 METHOD_NAMES: tuple[MethodName, ...] = (
+    "M0", "M1", "M2", "M3", "THESIS_FULL",
     "sgbm",
     "sgbm_fixed",
     "local",
@@ -29,6 +36,30 @@ METHOD_NAMES: tuple[MethodName, ...] = (
     "sgbm_flow",
     "research_full",
 )
+
+
+class SystemMode(str, Enum):
+    """System-level runtime intent; distinct from thesis MethodProfile labels."""
+
+    BASELINE = "BASELINE"
+    INNOVATION1 = "INNOVATION1"
+    ENHANCED_SHADOW = "ENHANCED_SHADOW"
+    FULL_ENHANCED = "FULL_ENHANCED"
+
+
+class Innovation2Mode(str, Enum):
+    OFF = "OFF"
+    SHADOW = "SHADOW"
+    CONTROLLED = "CONTROLLED"
+
+
+class Innovation3Mode(str, Enum):
+    OFF = "OFF"
+    DIAGNOSE = "DIAGNOSE"
+    CONTROLLED_RECOVERY = "CONTROLLED_RECOVERY"
+
+
+FINAL_RESULT_OWNER = "TemporalStereoPipeline"
 
 
 @dataclass(frozen=True)
@@ -44,9 +75,26 @@ class MethodProfile:
     use_icgn: bool = False
     use_adaptive_filter: bool = False
     use_camera_compensation: bool = False
+    adaptive_search: bool = False
+    use_confidence_feedback: bool = False
 
 
 _METHOD_PROFILES: dict[MethodName, MethodProfile] = {
+    # Thesis-facing, mutually controlled Innovation-1 comparisons.
+    "M0": MethodProfile(dense_sgbm_each_frame=True),
+    "M1": MethodProfile(use_flow=True),
+    "M2": MethodProfile(use_flow=True, use_prediction=True),
+    "M3": MethodProfile(
+        use_flow=True, use_prediction=True, use_epipolar=True,
+        use_neighborhood=True, use_subpixel=True, use_lr_check=True,
+        adaptive_search=True,
+    ),
+    "THESIS_FULL": MethodProfile(
+        use_flow=True, use_prediction=True, use_epipolar=True,
+        use_neighborhood=True, use_subpixel=True, use_lr_check=True,
+        adaptive_search=True, use_confidence_feedback=True,
+        use_camera_compensation=True,
+    ),
     "sgbm": MethodProfile(dense_sgbm_each_frame=True),
     "sgbm_fixed": MethodProfile(dense_sgbm_each_frame=True),
     "local": MethodProfile(),
@@ -80,6 +128,7 @@ _METHOD_PROFILES: dict[MethodName, MethodProfile] = {
         use_icgn=True,
         use_adaptive_filter=True,
         use_camera_compensation=True,
+        adaptive_search=True,
     ),
 }
 
@@ -122,6 +171,19 @@ class MatcherConfig:
     max_failures: int = 3
     recovery_interval_frames: int = 5
     recovery_search_radius: int = 32
+    adaptive_search_small_radius: int = 4
+    adaptive_search_normal_radius: int = 8
+    adaptive_search_large_radius: int = 16
+    adaptive_search_recovery_radius: int = 32
+    confidence_high_threshold: float = 0.75
+    confidence_medium_threshold: float = 0.45
+    confidence_low_threshold: float = 0.25
+    confidence_low_to_lost_frames: int = 3
+    enable_initial_confidence_calibration: bool = False
+    camera_compensation_mode: str = "multi_reference_rigid"
+    confidence_mode: str = "closed_loop"
+    uncertainty_neighbor_mad_reference: float = 1.0
+    uncertainty_weight_neighbor: float = 0.8
     enable_recovery: bool = True
     enable_pyramid: bool = True
     pyramid_levels: int = 3
@@ -199,14 +261,58 @@ class MatcherConfig:
     camera_compensation_ransac_iterations: int = 100
     camera_compensation_min_inlier_ratio: float = 0.60
     camera_compensation_max_rmse_mm: float = 3.0
+    enable_physics_shadow: bool = True
+    enable_fault_shadow: bool = True
+    allow_physics_correction_to_final: bool = False
+    allow_fault_recovery_to_final: bool = False
+    enable_target_accuracy_policy: bool = False
+    target_metric: str = "sigma"
+    target_sigma_x_mm: float | None = None
+    target_sigma_y_mm: float | None = None
+    target_sigma_z_mm: float | None = None
+    max_precision_retry: int = 1
+    max_precision_refinement_level: int = 2
 
     def __post_init__(self) -> None:
+        if self.allow_physics_correction_to_final or self.allow_fault_recovery_to_final:
+            raise NotImplementedError("first-round Shadow Mode cannot modify final output")
+        if self.target_metric != "sigma":
+            raise ValueError("target metric must be sigma")
+        target_sigmas = (
+            self.target_sigma_x_mm,
+            self.target_sigma_y_mm,
+            self.target_sigma_z_mm,
+        )
+        if any(value is not None and (not math.isfinite(value) or value <= 0) for value in target_sigmas):
+            raise ValueError("target sigma values must be positive and finite")
+        if self.enable_target_accuracy_policy and all(value is None for value in target_sigmas):
+            raise ValueError("enabled target-accuracy policy requires a target sigma")
+        if self.max_precision_retry < 0:
+            raise ValueError("max precision retry must be non-negative")
+        if self.max_precision_refinement_level < 0:
+            raise ValueError("max precision refinement level must be non-negative")
         if self.patch_size < 3 or self.patch_size % 2 == 0:
             raise ValueError("patch_size must be an odd integer of at least 3")
         if self.block_size < 3 or self.block_size % 2 == 0:
             raise ValueError("block_size must be an odd integer of at least 3")
         if self.search_radius < 1 or self.expanded_search_radius < self.search_radius:
             raise ValueError("expanded_search_radius must be at least search_radius")
+        radii = (
+            self.adaptive_search_small_radius, self.adaptive_search_normal_radius,
+            self.adaptive_search_large_radius, self.adaptive_search_recovery_radius,
+        )
+        if any(radius < 1 for radius in radii) or tuple(sorted(radii)) != radii:
+            raise ValueError("adaptive search radii must be positive and nondecreasing")
+        if not 0 <= self.confidence_low_threshold < self.confidence_medium_threshold < self.confidence_high_threshold <= 1:
+            raise ValueError("confidence thresholds must be ordered in [0, 1]")
+        if self.confidence_low_to_lost_frames < 1:
+            raise ValueError("confidence_low_to_lost_frames must be positive")
+        if self.camera_compensation_mode not in {"none", "single_reference", "multi_reference_rigid"}:
+            raise ValueError("camera_compensation_mode is invalid")
+        if self.confidence_mode not in {"none", "lr_only", "single_margin", "multi_reject", "closed_loop"}:
+            raise ValueError("confidence_mode is invalid")
+        if self.uncertainty_neighbor_mad_reference <= 0 or self.uncertainty_weight_neighbor < 0:
+            raise ValueError("neighbor uncertainty settings are invalid")
         if self.vertical_radius < 0:
             raise ValueError("vertical_radius must be non-negative")
         if (
@@ -342,6 +448,66 @@ class MatcherConfig:
 
 
 @dataclass(frozen=True)
+class ResolvedSystemMode:
+    """Validated system intent without changing matching or measurement algorithms."""
+
+    mode: SystemMode
+    matcher_config: MatcherConfig
+    enable_unified_innovation1: bool
+    innovation2_mode: Innovation2Mode
+    innovation3_mode: Innovation3Mode
+    final_owner: str = FINAL_RESULT_OWNER
+
+
+def resolve_system_mode(
+    mode: SystemMode | str,
+    *,
+    matcher_config: MatcherConfig | None = None,
+) -> ResolvedSystemMode:
+    """Resolve system modes deterministically and reject unavailable authority.
+
+    ``BASELINE`` is deliberately the frozen GUI production configuration, not a
+    request to disable all innovation-related observability flags.
+    """
+
+    try:
+        resolved_mode = mode if isinstance(mode, SystemMode) else SystemMode(mode)
+    except ValueError as exc:
+        raise ValueError(f"unknown system mode: {mode!r}") from exc
+
+    if resolved_mode is SystemMode.FULL_ENHANCED:
+        raise PermissionError(
+            "FULL_ENHANCED is unauthorized until controlled correction and recovery are validated"
+        )
+
+    resolved_config = matcher_config if matcher_config is not None else MatcherConfig()
+    frozen_baseline = MatcherConfig()
+    if resolved_mode is SystemMode.BASELINE and resolved_config != frozen_baseline:
+        raise ValueError(
+            "BASELINE requires the Phase 0 frozen MatcherConfig() without legacy flag overrides"
+        )
+
+    if resolved_mode in {SystemMode.INNOVATION1, SystemMode.ENHANCED_SHADOW}:
+        if not resolved_config.enable_physics_shadow or not resolved_config.enable_fault_shadow:
+            raise ValueError("system modes with Innovation 1 preserve frozen Shadow and Diagnose flags")
+        return ResolvedSystemMode(
+            mode=resolved_mode,
+            matcher_config=resolved_config,
+            enable_unified_innovation1=True,
+            innovation2_mode=Innovation2Mode.SHADOW,
+            innovation3_mode=Innovation3Mode.DIAGNOSE,
+        )
+
+    return ResolvedSystemMode(
+        mode=SystemMode.BASELINE,
+        matcher_config=frozen_baseline,
+        enable_unified_innovation1=False,
+        innovation2_mode=Innovation2Mode.SHADOW,
+        innovation3_mode=Innovation3Mode.DIAGNOSE,
+    )
+
+
+@dataclass(frozen=True)
 class PointSpec:
     point_id: str
     xy: tuple[float, float]
@@ -358,6 +524,9 @@ class SequenceManifest:
     points_path: Path
     point_specs: tuple[PointSpec, ...]
     ground_truth: Path | None = None
+    stereo_ground_truth: Path | None = None
+    external_ground_truth: Path | None = None
+    timestamps: Path | None = None
     output_dir: Path | None = None
 
     @classmethod
@@ -397,6 +566,16 @@ class SequenceManifest:
         if not specs:
             raise ValueError("Point annotation must contain at least one point")
         ground_truth = payload.get("ground_truth")
+        stereo_ground_truth = payload.get("stereo_ground_truth")
+        external_ground_truth = payload.get("external_ground_truth")
+        if ground_truth and not stereo_ground_truth and not external_ground_truth:
+            candidate = _resolve_path(base, ground_truth)
+            header = candidate.read_text(encoding="utf-8-sig").splitlines()[0] if candidate.exists() else ""
+            if "timestamp_s" in header:
+                external_ground_truth = ground_truth
+            else:
+                stereo_ground_truth = ground_truth
+        timestamps = payload.get("timestamps")
         output_dir = payload.get("output_dir")
         return cls(
             name=str(payload["name"]),
@@ -407,6 +586,9 @@ class SequenceManifest:
             points_path=points_path,
             point_specs=tuple(specs),
             ground_truth=None if ground_truth is None else _resolve_path(base, ground_truth),
+            stereo_ground_truth=None if stereo_ground_truth is None else _resolve_path(base, stereo_ground_truth),
+            external_ground_truth=None if external_ground_truth is None else _resolve_path(base, external_ground_truth),
+            timestamps=None if timestamps is None else _resolve_path(base, timestamps),
             output_dir=None if output_dir is None else _resolve_path(base, output_dir),
         )
 
@@ -456,6 +638,9 @@ class PointState:
     last_kalman_innovation: float | None = None
     last_kalman_gain_disparity: float | None = None
     last_nis: float | None = None
+    confidence_state: str = "HIGH"
+    low_confidence_frames: int = 0
+    last_prediction_residual_px: float | None = None
 
     @property
     def disparity(self) -> float | None:
@@ -641,6 +826,7 @@ class FramePointResult:
     delta_z_mm: float | None = None
     subpixel_offset: float | None = None
     neighbor_disparity: float | None = None
+    neighbor_disparity_mad: float | None = None
     used_search_radius: int = 0
     quality_stage: str = ""
     recovery_stage: str = ""
@@ -701,18 +887,166 @@ class FramePointResult:
     camera_ty_mm: float | None = None
     camera_tz_mm: float | None = None
     camera_rotation_angle_deg: float | None = None
+    camera_rx_deg: float | None = None
+    camera_ry_deg: float | None = None
+    camera_rz_deg: float | None = None
     compensated_x_m: float | None = None
     compensated_y_m: float | None = None
     compensated_z_m: float | None = None
     final_x_m: float | None = None
     final_y_m: float | None = None
     final_z_m: float | None = None
+    system_mode: str = SystemMode.BASELINE.value
+    final_owner: str = FINAL_RESULT_OWNER
     raw_delta_x_mm: float | None = None
     raw_delta_y_mm: float | None = None
     raw_delta_z_mm: float | None = None
     compensated_delta_x_mm: float | None = None
     compensated_delta_y_mm: float | None = None
     compensated_delta_z_mm: float | None = None
+    predicted_disparity: float | None = None
+    previous_disparity: float | None = None
+    disparity_velocity: float | None = None
+    prediction_residual_px: float | None = None
+    adaptive_search_radius: int | None = None
+    search_radius_reason: str = ""
+    confidence_texture: float | None = None
+    confidence_photo: float | None = None
+    confidence_margin: float | None = None
+    confidence_flow: float | None = None
+    confidence_lr: float | None = None
+    confidence_cycle: float | None = None
+    confidence_icgn: float | None = None
+    confidence_curvature: float | None = None
+    confidence_temporal: float | None = None
+    confidence_neighbor: float | None = None
+    confidence_total: float | None = None
+    confidence_state: str = "HIGH"
+    confidence_source: str = "legacy_or_temporal"
+    candidate_count: int | None = None
+    initial_best_disparity: float | None = None
+    initial_disparity_disagreement: float | None = None
+    shadow_input_x_m: float | None = None
+    shadow_input_y_m: float | None = None
+    shadow_input_z_m: float | None = None
+    shadow_input_stage: str = ""
+    candidate_corrected_x_m: float | None = None
+    candidate_corrected_y_m: float | None = None
+    candidate_corrected_z_m: float | None = None
+    c_phy: float | None = None
+    c_phy_valid: bool | None = None
+    c_phy_valid_terms: str = ""
+    c_phy_missing_terms: str = ""
+    transient_protected: bool | None = None
+    fault_class: str = ""
+    fault_confidence: float | None = None
+    recommended_recovery: str = ""
+    r_2d3d: float | None = None
+    r_temporal: float | None = None
+    r_spatial: float | None = None
+    r_frequency: float | None = None
+    r_phase: float | None = None
+    r_coherence: float | None = None
+    r_lr: float | None = None
+    r_epi: float | None = None
+    r_fb: float | None = None
+    r_ref: float | None = None
+    r_calib: float | None = None
+    accuracy_policy_enabled: bool = False
+    precision_policy_warmup: bool | None = None
+    target_metric: str = ""
+    target_x_mm: float | None = None
+    target_y_mm: float | None = None
+    target_z_mm: float | None = None
+    required_sigma_d_px: float | None = None
+    estimated_sigma_d_px: float | None = None
+    estimated_sigma_x_mm: float | None = None
+    estimated_sigma_y_mm: float | None = None
+    estimated_sigma_z_mm: float | None = None
+    precision_ratio: float | None = None
+    precision_feasible: bool | None = None
+    precision_status: str = ""
+    limiting_axis: str = ""
+    policy_base_search_radius_px: int | None = None
+    policy_final_search_radius_px: int | None = None
+    policy_refinement_level: int | None = None
+    policy_retry_budget: int | None = None
+    policy_precision_retry_count: int | None = None
+    policy_acceptance_reason: str = ""
+    policy_reason: str = ""
+    retry_triggered: bool | None = None
+    retry_candidate_accepted: bool | None = None
+    retry_sigma_before_px: float | None = None
+    retry_sigma_after_px: float | None = None
+    retry_match_cost_before: float | None = None
+    retry_match_cost_after: float | None = None
+    retry_lr_error_before_px: float | None = None
+    retry_lr_error_after_px: float | None = None
+    # Phase 4 experiment-only diagnostics.  They are deliberately omitted from
+    # ``as_csv_row`` to preserve the legacy production CSV contract.
+    final_distance_m: float | None = None
+    final_valid: bool | None = None
+    proposed_decision: str = ""
+    committed_decision: str = ""
+    write_committed: bool | None = None
+    result_source: str = ""
+    final_decision_reason: str = ""
+    i2_state: str = ""
+    i2_episode_id: int | None = None
+    i2_prediction_x_m: float | None = None
+    i2_prediction_y_m: float | None = None
+    i2_prediction_z_m: float | None = None
+    candidate_safe: bool | None = None
+    candidate_safety_reasons: str = ""
+
+    def __post_init__(self) -> None:
+        if self.final_owner != FINAL_RESULT_OWNER:
+            raise ValueError(f"FINAL owner must be {FINAL_RESULT_OWNER}")
+
+    @staticmethod
+    def _xyz_or_none(
+        x_m: float | None, y_m: float | None, z_m: float | None,
+    ) -> tuple[float, float, float] | None:
+        if x_m is None or y_m is None or z_m is None:
+            return None
+        return (x_m, y_m, z_m)
+
+    @property
+    def triangulated_xyz_m(self) -> tuple[float, float, float] | None:
+        """Direct accepted-match reprojection, named separately from filtered output."""
+
+        return self._xyz_or_none(self.measured_x_m, self.measured_y_m, self.measured_z_m)
+
+    @property
+    def pipeline_baseline_xyz_m(self) -> tuple[float, float, float] | None:
+        """Existing Pipeline output used as the only Innovation 2 comparison input."""
+
+        compensated = self._xyz_or_none(
+            self.compensated_x_m, self.compensated_y_m, self.compensated_z_m,
+        )
+        if compensated is not None:
+            return compensated
+        return self._xyz_or_none(self.estimated_x_m, self.estimated_y_m, self.estimated_z_m)
+
+    @property
+    def pipeline_baseline_source(self) -> str:
+        if self._xyz_or_none(self.compensated_x_m, self.compensated_y_m, self.compensated_z_m) is not None:
+            return "COMPENSATED"
+        if self._xyz_or_none(self.estimated_x_m, self.estimated_y_m, self.estimated_z_m) is not None:
+            return "ESTIMATED"
+        return "UNAVAILABLE"
+
+    @property
+    def candidate_xyz_m(self) -> tuple[float, float, float] | None:
+        return self._xyz_or_none(
+            self.candidate_corrected_x_m,
+            self.candidate_corrected_y_m,
+            self.candidate_corrected_z_m,
+        )
+
+    @property
+    def final_xyz_m(self) -> tuple[float, float, float] | None:
+        return self._xyz_or_none(self.final_x_m, self.final_y_m, self.final_z_m)
 
     @classmethod
     def invalid(
@@ -798,6 +1132,7 @@ class FramePointResult:
             "delta_Z_mm": self.delta_z_mm,
             "subpixel_offset": self.subpixel_offset,
             "neighbor_disparity": self.neighbor_disparity,
+            "neighbor_disparity_mad": self.neighbor_disparity_mad,
             "used_search_radius": self.used_search_radius,
             "quality_stage": self.quality_stage,
             "recovery_stage": self.recovery_stage,
@@ -858,6 +1193,9 @@ class FramePointResult:
             "camera_ty_mm": self.camera_ty_mm,
             "camera_tz_mm": self.camera_tz_mm,
             "camera_rotation_angle_deg": self.camera_rotation_angle_deg,
+            "camera_rx_deg": self.camera_rx_deg,
+            "camera_ry_deg": self.camera_ry_deg,
+            "camera_rz_deg": self.camera_rz_deg,
             "compensated_X_m": self.compensated_x_m,
             "compensated_Y_m": self.compensated_y_m,
             "compensated_Z_m": self.compensated_z_m,
@@ -870,6 +1208,80 @@ class FramePointResult:
             "compensated_delta_X_mm": self.compensated_delta_x_mm,
             "compensated_delta_Y_mm": self.compensated_delta_y_mm,
             "compensated_delta_Z_mm": self.compensated_delta_z_mm,
+            "predicted_disparity": self.predicted_disparity,
+            "previous_disparity": self.previous_disparity,
+            "disparity_velocity": self.disparity_velocity,
+            "prediction_residual_px": self.prediction_residual_px,
+            "adaptive_search_radius": self.adaptive_search_radius,
+            "search_radius_reason": self.search_radius_reason,
+            "confidence_texture": self.confidence_texture,
+            "confidence_photo": self.confidence_photo,
+            "confidence_margin": self.confidence_margin,
+            "confidence_flow": self.confidence_flow,
+            "confidence_lr": self.confidence_lr,
+            "confidence_cycle": self.confidence_cycle,
+            "confidence_icgn": self.confidence_icgn,
+            "confidence_curvature": self.confidence_curvature,
+            "confidence_temporal": self.confidence_temporal,
+            "confidence_neighbor": self.confidence_neighbor,
+            "confidence_total": self.confidence_total,
+            "confidence_state": self.confidence_state,
+            "shadow_input_x_m": self.shadow_input_x_m,
+            "shadow_input_y_m": self.shadow_input_y_m,
+            "shadow_input_z_m": self.shadow_input_z_m,
+            "shadow_input_stage": self.shadow_input_stage,
+            "candidate_corrected_x_m": self.candidate_corrected_x_m,
+            "candidate_corrected_y_m": self.candidate_corrected_y_m,
+            "candidate_corrected_z_m": self.candidate_corrected_z_m,
+            "c_phy": self.c_phy,
+            "c_phy_valid": self.c_phy_valid,
+            "c_phy_valid_terms": self.c_phy_valid_terms,
+            "c_phy_missing_terms": self.c_phy_missing_terms,
+            "transient_protected": self.transient_protected,
+            "fault_class": self.fault_class,
+            "fault_confidence": self.fault_confidence,
+            "recommended_recovery": self.recommended_recovery,
+            "r_2d3d": self.r_2d3d,
+            "r_temporal": self.r_temporal,
+            "r_spatial": self.r_spatial,
+            "r_frequency": self.r_frequency,
+            "r_phase": self.r_phase,
+            "r_coherence": self.r_coherence,
+            "r_lr": self.r_lr,
+            "r_epi": self.r_epi,
+            "r_fb": self.r_fb,
+            "r_ref": self.r_ref,
+            "r_calib": self.r_calib,
+            "accuracy_policy_enabled": self.accuracy_policy_enabled,
+            "precision_policy_warmup": self.precision_policy_warmup,
+            "target_metric": self.target_metric,
+            "target_x_mm": self.target_x_mm,
+            "target_y_mm": self.target_y_mm,
+            "target_z_mm": self.target_z_mm,
+            "required_sigma_d_px": self.required_sigma_d_px,
+            "estimated_sigma_d_px": self.estimated_sigma_d_px,
+            "estimated_sigma_x_mm": self.estimated_sigma_x_mm,
+            "estimated_sigma_y_mm": self.estimated_sigma_y_mm,
+            "estimated_sigma_z_mm": self.estimated_sigma_z_mm,
+            "precision_ratio": self.precision_ratio,
+            "precision_feasible": self.precision_feasible,
+            "precision_status": self.precision_status,
+            "limiting_axis": self.limiting_axis,
+            "policy_base_search_radius_px": self.policy_base_search_radius_px,
+            "policy_final_search_radius_px": self.policy_final_search_radius_px,
+            "policy_refinement_level": self.policy_refinement_level,
+            "policy_retry_budget": self.policy_retry_budget,
+            "policy_precision_retry_count": self.policy_precision_retry_count,
+            "policy_acceptance_reason": self.policy_acceptance_reason,
+            "policy_reason": self.policy_reason,
+            "retry_triggered": self.retry_triggered,
+            "retry_candidate_accepted": self.retry_candidate_accepted,
+            "retry_sigma_before_px": self.retry_sigma_before_px,
+            "retry_sigma_after_px": self.retry_sigma_after_px,
+            "retry_match_cost_before": self.retry_match_cost_before,
+            "retry_match_cost_after": self.retry_match_cost_after,
+            "retry_lr_error_before_px": self.retry_lr_error_before_px,
+            "retry_lr_error_after_px": self.retry_lr_error_after_px,
         }
         return {
             key: "" if value is None or (isinstance(value, float) and not math.isfinite(value)) else value

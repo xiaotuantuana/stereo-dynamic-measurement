@@ -207,7 +207,7 @@ class FinalArbitrator:
                 False,
                 None,
                 diagnosis.reason or "blocking_or_invalid_baseline",
-                False,
+                True,
                 authority,
             )
         if baseline.valid:

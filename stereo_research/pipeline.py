@@ -7,12 +7,31 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .camera_compensation import apply_rigid_transform, estimate_camera_compensation
+from stereo_dynamic_measurement.innovation1.precision_planner import (
+    TargetAccuracySpec,
+    build_precision_plan,
+)
+
+from .camera_compensation import CameraCompensationResult, apply_rigid_transform, estimate_camera_compensation, rotation_matrix_to_euler_xyz_deg
+from .accuracy_policy import MeasurementPolicyDecision, decide_measurement_policy
+from .confidence import ConfidenceDecision, decide_confidence
 from .cycle_consistency import evaluate_cycle_consistency
 from .filtering import AdaptivePointKalman
+from .enhanced_processor import EnhancedPointProcessor, I2Evidence, TimedObservation
+from .final_arbitration import (
+    ArbitrationDecision,
+    ExperimentAuthority,
+    FinalArbitrator,
+    FinalDecision,
+    I1BaselineView,
+    I3Action,
+    I3Recommendation,
+    I3Risk,
+    ResultSource,
+)
 from .geometry import reproject_point_m
 from .global_matching import GlobalSample, GlobalStereoMatcher, GlobalStereoResult
-from .local_matching import LocalMatcher, QualityLocalMatcher, predict_disparity
+from .local_matching import LocalMatchResult, LocalMatcher, QualityLocalMatcher, predict_disparity
 from .models import (
     FramePointResult,
     MatcherConfig,
@@ -23,6 +42,11 @@ from .models import (
 )
 from .tracking import track_point_lk, track_xy_lk
 from .uncertainty import estimate_match_uncertainty
+from .shadow_analysis import ShadowAnalyzer
+
+
+def _confidence_component(risk: float | None, config: MatcherConfig) -> float | None:
+    return None if risk is None else float(np.clip(1.0 - risk / config.uncertainty_max_component, 0.0, 1.0))
 
 
 class TemporalStereoPipeline:
@@ -32,12 +56,17 @@ class TemporalStereoPipeline:
         q: np.ndarray,
         calibration_unit: str,
         config: MatcherConfig | None = None,
+        experiment_authority: ExperimentAuthority | None = None,
     ):
         self.method = method
         self.profile = method_profile(method)
         self.q = np.asarray(q, dtype=np.float64)
         self.calibration_unit = calibration_unit
         self.config = config or MatcherConfig()
+        # No production or GUI caller receives this opt-in authority by default.
+        self.experiment_authority = experiment_authority
+        self.enhanced_processors: dict[str, EnhancedPointProcessor] = {}
+        self.final_arbitrator = FinalArbitrator()
         self.global_matcher = GlobalStereoMatcher(self.config)
         self.local_matcher = (
             QualityLocalMatcher(self.config)
@@ -58,6 +87,21 @@ class TemporalStereoPipeline:
         self.flow_reference_gray: dict[str, np.ndarray] = {}
         self.right_flow_reference_gray: dict[str, np.ndarray] = {}
         self.filters: dict[str, AdaptivePointKalman] = {}
+        self.shadow_analyzer = (
+            ShadowAnalyzer()
+            if self.config.enable_physics_shadow or self.config.enable_fault_shadow
+            else None
+        )
+        self.target_accuracy_spec = (
+            TargetAccuracySpec(
+                metric=self.config.target_metric,
+                target_sigma_x_mm=self.config.target_sigma_x_mm,
+                target_sigma_y_mm=self.config.target_sigma_y_mm,
+                target_sigma_z_mm=self.config.target_sigma_z_mm,
+            )
+            if self.config.enable_target_accuracy_policy
+            else None
+        )
         self.initialized = False
 
     def initialize(
@@ -116,25 +160,96 @@ class TemporalStereoPipeline:
                     )
                 )
                 continue
+            initial_diagnostics = None
+            if self.config.enable_initial_confidence_calibration:
+                initial_diagnostics = self.local_matcher.diagnose_initial(
+                    left_gray,
+                    right_gray,
+                    point.xy,
+                    sample.disparity,
+                    max_disparity=self.config.expanded_num_disparities - 1,
+                    lr_error_px=sample.lr_error_px,
+                )
+                initial_rejected = (
+                    initial_diagnostics.status != "valid"
+                    or initial_diagnostics.uniqueness_margin is None
+                    or initial_diagnostics.uniqueness_margin < self.config.uniqueness_margin
+                    or initial_diagnostics.confidence < self.config.confidence_medium_threshold
+                )
+                if initial_rejected:
+                    state.record_failure("initial_ambiguous", self.config.max_failures)
+                    rejected = FramePointResult.invalid(
+                        method=self.method,
+                        frame=frame,
+                        point_state=state,
+                        status="initial_ambiguous",
+                        matching_ms=initialization_matching_ms,
+                        total_ms=initialization_matching_ms,
+                    )
+                    results.append(replace(
+                        rejected,
+                        measured_right_x=sample.right_xy[0],
+                        measured_right_y=sample.right_xy[1],
+                        measured_disparity=sample.disparity,
+                        raw_disparity=sample.disparity,
+                        integer_disparity=float(round(sample.disparity)),
+                        subpixel_offset=sample.disparity - round(sample.disparity),
+                        match_cost=initial_diagnostics.predicted_cost,
+                        lr_error_px=sample.lr_error_px,
+                        confidence=initial_diagnostics.confidence,
+                        confidence_total=initial_diagnostics.confidence,
+                        confidence_state="LOW",
+                        confidence_source="initial_runtime_evidence",
+                        measurement_accepted_for_state=False,
+                        state_update_source="rejected",
+                        texture_std=initial_diagnostics.texture_std,
+                        second_best_cost=initial_diagnostics.second_best_cost,
+                        uniqueness_margin_value=initial_diagnostics.uniqueness_margin,
+                        candidate_count=initial_diagnostics.candidate_count,
+                        initial_best_disparity=initial_diagnostics.best_disparity,
+                        initial_disparity_disagreement=initial_diagnostics.predicted_best_disagreement,
+                    ))
+                    continue
             result = self._valid_result(
                     frame,
                     state,
                     sample.right_xy,
                     sample.disparity,
-                    match_cost=None,
+                    match_cost=(initial_diagnostics.predicted_cost if initial_diagnostics else None),
                     lr_error=sample.lr_error_px,
-                    confidence=1.0,
+                    confidence=(initial_diagnostics.confidence if initial_diagnostics else 1.0),
                     flow_ms=0.0,
                     matching_ms=initialization_matching_ms,
                     total_ms=initialization_matching_ms,
+                    raw_disparity=(sample.disparity if initial_diagnostics else None),
+                    integer_disparity=(float(round(sample.disparity)) if initial_diagnostics else None),
+                    subpixel_offset=(sample.disparity - round(sample.disparity) if initial_diagnostics else None),
+                    used_search_radius=(self.config.expanded_num_disparities - 1 if initial_diagnostics else 0),
+                    texture_std=(initial_diagnostics.texture_std if initial_diagnostics else None),
+                    second_best_cost=(initial_diagnostics.second_best_cost if initial_diagnostics else None),
+                    uniqueness_margin_value=(initial_diagnostics.uniqueness_margin if initial_diagnostics else None),
+                )
+            if initial_diagnostics is not None:
+                result = replace(
+                    result,
+                    confidence_source="initial_runtime_evidence",
+                    candidate_count=initial_diagnostics.candidate_count,
+                    initial_best_disparity=initial_diagnostics.best_disparity,
+                    initial_disparity_disagreement=initial_diagnostics.predicted_best_disagreement,
                 )
             if result.status == "valid":
+                result = self._annotate_accuracy_policy(
+                    result,
+                    base_search_radius_px=self.config.search_radius,
+                    precision_retry_count=0,
+                    warmup=True,
+                )
                 result = self._finalize_right_flow_reference(result, frame, right_gray)
             results.append(result)
         self.previous_left_gray = left_gray.copy()
         self.previous_right_gray = right_gray.copy()
         self.initialized = True
-        return self._apply_camera_compensation(results)
+        return self._finalize_frame_results(results)
 
     def step(
         self,
@@ -156,7 +271,7 @@ class TemporalStereoPipeline:
             recovery_stage = ""
             if state.status == "lost":
                 can_attempt = (
-                    self.method in {"full_quality", "research_full"}
+                    (self.profile.adaptive_search or self.profile.use_confidence_feedback or self.method == "full_quality")
                     and self.config.enable_recovery
                     and frame % self.config.recovery_interval_frames == 0
                 )
@@ -175,17 +290,17 @@ class TemporalStereoPipeline:
                     )
                     continue
                 recovery_attempt = True
-                recovery_stage = "attempt"
+                recovery_stage = "local_recovery"
                 state.recovery_attempt_count += 1
                 if state.recovery_started_frame is None:
                     state.recovery_started_frame = frame
             elif (
                 state.status == "recovering"
-                and self.method in {"full_quality", "research_full"}
+                and (self.profile.adaptive_search or self.profile.use_confidence_feedback or self.method == "full_quality")
                 and self.config.enable_recovery
             ):
                 recovery_attempt = True
-                recovery_stage = "attempt"
+                recovery_stage = "local_recovery"
                 state.recovery_attempt_count += 1
                 if state.recovery_started_frame is None:
                     state.recovery_started_frame = frame
@@ -298,11 +413,17 @@ class TemporalStereoPipeline:
 
             prediction_history = (
                 state.estimated_disparity_history
-                if self.method == "research_full" and state.estimated_disparity_history
+                if self.profile.use_confidence_feedback and state.estimated_disparity_history
                 else state.disparity_history
             )
             latest = prediction_history[-1] if prediction_history else None
-            if latest is None:
+            # Only C3/THESIS_FULL turns LOST into a confidence-driven global
+            # reinitialization. Legacy quality recovery keeps its prior local path.
+            must_reinitialize = (
+                recovery_attempt and state.status == "lost"
+                and self.profile.use_confidence_feedback
+            )
+            if latest is None or must_reinitialize:
                 if recovery_attempt:
                     recovery_start = time.perf_counter()
                     recovery_dense = self.global_matcher.compute(left_gray, right_gray)
@@ -326,6 +447,12 @@ class TemporalStereoPipeline:
                         and recovery_sample.disparity is not None
                         and recovery_sample.right_xy is not None
                     ):
+                        # A global correspondence is a new track origin: do not let
+                        # old prediction or Kalman state bias the recovered trajectory.
+                        state.disparity_history.clear()
+                        state.estimated_disparity_history.clear()
+                        state.latest_disparity = None
+                        self.filters.pop(state.point_id, None)
                         recovered_result = self._valid_result(
                                 frame,
                                 state,
@@ -338,15 +465,40 @@ class TemporalStereoPipeline:
                                 recovery_matching_ms,
                                 (time.perf_counter() - point_start) * 1000.0,
                                 flow_error,
-                                recovery_stage="sgbm_reinitialized",
+                                recovery_stage=(
+                                    "global_reinitialization"
+                                    if must_reinitialize else "sgbm_reinitialized"
+                                ),
                             )
-                        if recovered_result.status == "valid":
+                        if recovered_result.status == "valid" and recovered_result.measurement_accepted_for_state:
+                            if must_reinitialize:
+                                recovered_result = replace(
+                                    recovered_result,
+                                    recovery_stage="reinitialization_success",
+                                )
                             recovered_result = self._finalize_right_flow_reference(
                                 recovered_result,
                                 frame,
                                 right_gray,
                             )
+                        elif must_reinitialize:
+                            recovered_result = replace(
+                                recovered_result,
+                                recovery_stage="reinitialization_failed",
+                            )
                         results.append(recovered_result)
+                        continue
+                    if must_reinitialize:
+                        state.record_failure("reinitialization_failed", self.config.max_failures)
+                        results.append(
+                            FramePointResult.invalid(
+                                self.method, frame, state, "lost", flow_ms=flow_ms,
+                                matching_ms=recovery_matching_ms,
+                                total_ms=(time.perf_counter() - point_start) * 1000.0,
+                                flow_fb_error_px=flow_error,
+                                recovery_stage="reinitialization_failed",
+                            )
+                        )
                         continue
                 state.record_failure("ambiguous", self.config.max_failures)
                 results.append(
@@ -371,12 +523,32 @@ class TemporalStereoPipeline:
                 if self.profile.use_prediction and self.config.enable_prediction
                 else latest
             )
+            previous_disparity = prediction_history[-2] if len(prediction_history) >= 2 else None
+            disparity_velocity = (
+                None if previous_disparity is None else float(latest - previous_disparity)
+            )
             if temporal_right_xy is not None:
                 cycle_predicted = state.left_xy[0] - temporal_right_xy[0]
                 blend = self.config.cycle_prediction_blend
                 predicted = float((1.0 - blend) * predicted + blend * cycle_predicted)
             matching_start = time.perf_counter()
             matcher = self.recovery_matcher if recovery_attempt else self.local_matcher
+            adaptive_radius, radius_reason = self._determine_search_radius(
+                state, disparity_velocity, recovery_attempt
+            )
+            if self.profile.use_confidence_feedback and self.config.confidence_mode == "closed_loop":
+                overlay = {
+                    "HIGH": self.config.adaptive_search_small_radius,
+                    "MEDIUM": self.config.adaptive_search_normal_radius,
+                    "LOW": self.config.adaptive_search_large_radius,
+                    "LOST": self.config.adaptive_search_recovery_radius,
+                }[state.confidence_state]
+                if overlay > adaptive_radius:
+                    adaptive_radius, radius_reason = overlay, f"confidence_{state.confidence_state.lower()}"
+            pre_match_policy = self._pre_match_accuracy_policy(state, adaptive_radius)
+            refinement_level = (
+                pre_match_policy.refinement_level if pre_match_policy is not None else 0
+            )
             match = matcher.match(
                 left_gray,
                 right_gray,
@@ -386,6 +558,8 @@ class TemporalStereoPipeline:
                 latest_disparity=latest,
                 temporal_right_xy=temporal_right_xy,
                 right_flow_fb_error_px=right_flow_error,
+                search_radius=adaptive_radius,
+                refinement_level=refinement_level,
             )
             matching_ms = (time.perf_counter() - matching_start) * 1000.0
             if match.status != "valid" or match.disparity is None or match.right_xy is None:
@@ -464,6 +638,107 @@ class TemporalStereoPipeline:
                     cycle_error_px=cycle_check.error_px,
                     cycle_cost=cycle_check.cost,
                 )
+            precision_retry_count = 0
+            retry_triggered = False
+            retry_candidate_accepted = False
+            retry_sigma_before: float | None = None
+            retry_sigma_after: float | None = None
+            retry_match_cost_before: float | None = None
+            retry_match_cost_after: float | None = None
+            retry_lr_error_before: float | None = None
+            retry_lr_error_after: float | None = None
+            post_match_policy = self._match_accuracy_policy(
+                match,
+                state,
+                base_search_radius_px=adaptive_radius,
+                flow_fb_error_px=flow_error,
+                right_flow_fb_error_px=right_flow_error,
+                precision_retry_count=0,
+            )
+            for retry_index in range(1, self.config.max_precision_retry + 1):
+                if (
+                    post_match_policy is None
+                    or post_match_policy.precision_status != "RETRY_STRONGER"
+                ):
+                    break
+                retry_triggered = True
+                retry_sigma_before = post_match_policy.estimated_sigma_d_px
+                retry_match_cost_before = match.cost
+                retry_lr_error_before = match.lr_error_px
+                retry_level = min(
+                    refinement_level + retry_index,
+                    self.config.max_precision_refinement_level,
+                )
+                retry_match = matcher.match(
+                    left_gray,
+                    right_gray,
+                    state.left_xy,
+                    predicted,
+                    self.profile,
+                    latest_disparity=latest,
+                    temporal_right_xy=temporal_right_xy,
+                    right_flow_fb_error_px=right_flow_error,
+                    search_radius=adaptive_radius,
+                    refinement_level=retry_level,
+                )
+                precision_retry_count = retry_index
+                if (
+                    retry_match.status == "valid"
+                    and retry_match.disparity is not None
+                    and retry_match.right_xy is not None
+                ):
+                    retry_usable = True
+                    if temporal_right_xy is not None:
+                        retry_cycle = evaluate_cycle_consistency(
+                            retry_match.right_xy,
+                            temporal_right_xy,
+                            self.config,
+                        )
+                        retry_usable = retry_cycle.status != "cycle_failed"
+                        if retry_usable:
+                            retry_match = replace(
+                                retry_match,
+                                confidence=retry_match.confidence * retry_cycle.confidence_scale,
+                                cycle_error_px=retry_cycle.error_px,
+                                cycle_cost=retry_cycle.cost,
+                            )
+                    if retry_usable:
+                        retry_policy = self._match_accuracy_policy(
+                            retry_match,
+                            state,
+                            base_search_radius_px=adaptive_radius,
+                            flow_fb_error_px=flow_error,
+                            right_flow_fb_error_px=right_flow_error,
+                            precision_retry_count=retry_index,
+                        )
+                        if (
+                            retry_policy is not None
+                            and retry_policy.estimated_sigma_d_px is not None
+                            and (
+                                post_match_policy.estimated_sigma_d_px is None
+                                or retry_policy.estimated_sigma_d_px
+                                <= post_match_policy.estimated_sigma_d_px
+                            )
+                        ):
+                            match = retry_match
+                            retry_candidate_accepted = True
+                            retry_sigma_after = retry_policy.estimated_sigma_d_px
+                            retry_match_cost_after = retry_match.cost
+                            retry_lr_error_after = retry_match.lr_error_px
+                        elif retry_policy is not None:
+                            retry_sigma_after = retry_policy.estimated_sigma_d_px
+                            retry_match_cost_after = retry_match.cost
+                            retry_lr_error_after = retry_match.lr_error_px
+                post_match_policy = self._match_accuracy_policy(
+                    match,
+                    state,
+                    base_search_radius_px=adaptive_radius,
+                    flow_fb_error_px=flow_error,
+                    right_flow_fb_error_px=right_flow_error,
+                    precision_retry_count=retry_index,
+                )
+            if precision_retry_count:
+                matching_ms = (time.perf_counter() - matching_start) * 1000.0
             point_result = self._valid_result(
                     frame,
                     state,
@@ -483,6 +758,7 @@ class TemporalStereoPipeline:
                     integer_disparity=match.integer_disparity,
                     subpixel_offset=match.subpixel_offset,
                     neighbor_disparity=match.neighbor_disparity,
+                    neighbor_disparity_mad=match.neighbor_disparity_mad,
                     used_search_radius=match.used_search_radius,
                     quality_stage=match.quality_stage,
                     recovery_stage="recaptured" if recovery_attempt else recovery_stage,
@@ -512,6 +788,23 @@ class TemporalStereoPipeline:
                     subpixel_final_status=match.subpixel_final_status,
                 )
             if point_result.status == "valid":
+                point_result = self._annotate_accuracy_policy(
+                    point_result,
+                    base_search_radius_px=adaptive_radius,
+                    precision_retry_count=precision_retry_count,
+                    warmup=False,
+                )
+                point_result = replace(
+                    point_result,
+                    retry_triggered=retry_triggered,
+                    retry_candidate_accepted=retry_candidate_accepted if retry_triggered else None,
+                    retry_sigma_before_px=retry_sigma_before,
+                    retry_sigma_after_px=retry_sigma_after,
+                    retry_match_cost_before=retry_match_cost_before,
+                    retry_match_cost_after=retry_match_cost_after,
+                    retry_lr_error_before_px=retry_lr_error_before,
+                    retry_lr_error_after_px=retry_lr_error_after,
+                )
                 point_result = self._finalize_right_flow_reference(
                     point_result,
                     frame,
@@ -523,7 +816,387 @@ class TemporalStereoPipeline:
                 state.last_right_flow_fb_error_px = right_flow_error
         self.previous_left_gray = left_gray.copy()
         self.previous_right_gray = right_gray.copy()
-        return self._apply_camera_compensation(results)
+        return self._finalize_frame_results(results)
+
+    def _finalize_frame_results(self, results: list[FramePointResult]) -> list[FramePointResult]:
+        completed = self._apply_camera_compensation(results)
+        if self.shadow_analyzer is None:
+            shadowed = completed
+        else:
+            shadowed = self.shadow_analyzer.process_frame(completed)
+        if self.experiment_authority is None:
+            return shadowed
+        try:
+            return self._process_enhanced_results(shadowed)
+        except Exception as exc:
+            return [self._enhanced_fallback(result, exc) for result in shadowed]
+
+    def _process_enhanced_results(
+        self,
+        results: list[FramePointResult],
+    ) -> list[FramePointResult]:
+        """Run experiment-only I2/I3/arbitration after the I1 result is frozen."""
+
+        if self.experiment_authority is None:
+            return results
+        processed: list[FramePointResult] = []
+        for result in results:
+            baseline = I1BaselineView.from_result(result)
+            xyz_mm = (
+                tuple(float(value) * 1000.0 for value in baseline.xyz_m)
+                if baseline.xyz_m is not None
+                else (float("nan"), float("nan"), float("nan"))
+            )
+            hard_failure = not baseline.valid
+            fault_class = result.fault_class.strip().upper()
+            confirmed_anomaly = (
+                not hard_failure
+                and fault_class not in {"", "NORMAL"}
+                and result.c_phy_valid is True
+                and result.c_phy is not None
+                and result.c_phy < 0.55
+            )
+            evidence = I2Evidence(
+                confirmed_anomaly=confirmed_anomaly,
+                legitimate_motion=bool(result.transient_protected),
+                hard_failure=hard_failure,
+                geometry_valid=baseline.valid,
+                evidence_sufficient=(result.c_phy_valid is True) if confirmed_anomaly else True,
+                post_correction_safe=True,
+                suspicious=(fault_class not in {"", "NORMAL"}),
+            )
+            processor = self.enhanced_processors.setdefault(result.point_id, EnhancedPointProcessor())
+            outcome = processor.process(
+                TimedObservation(
+                    frame=result.frame,
+                    timestamp_s=float(result.frame),
+                    xyz_mm=xyz_mm,
+                    evidence=evidence,
+                )
+            )
+            diagnosis = self._structured_i3_recommendation(result, hard_failure=hard_failure)
+            decision = self.final_arbitrator.decide(
+                baseline=baseline,
+                candidate_safety=outcome.candidate_safety,
+                diagnosis=diagnosis,
+                authority=self.experiment_authority,
+            )
+            prediction = outcome.prediction_xyz_mm
+            audited = replace(
+                result,
+                i2_state=outcome.state.value,
+                i2_episode_id=outcome.episode_id,
+                i2_prediction_x_m=(None if prediction is None else prediction[0] / 1000.0),
+                i2_prediction_y_m=(None if prediction is None else prediction[1] / 1000.0),
+                i2_prediction_z_m=(None if prediction is None else prediction[2] / 1000.0),
+                candidate_safe=outcome.candidate_safety.safe,
+                candidate_safety_reasons=";".join(outcome.candidate_safety.failed_reasons),
+            )
+            if decision.write_committed:
+                processed.append(self._apply_final_decision(audited, decision))
+            else:
+                processed.append(
+                    replace(
+                        audited,
+                        final_valid=baseline.valid,
+                        proposed_decision=decision.proposed_decision.value,
+                        committed_decision=decision.committed_decision.value,
+                        write_committed=False,
+                        result_source=decision.result_source.value,
+                        final_decision_reason=decision.reason,
+                    )
+                )
+        return processed
+
+    @staticmethod
+    def _structured_i3_recommendation(
+        result: FramePointResult,
+        *,
+        hard_failure: bool,
+    ) -> I3Recommendation:
+        if hard_failure:
+            return I3Recommendation(I3Risk.BLOCKING, "i1_hard_failure", I3Action.BLOCK_FINAL)
+        fault_class = result.fault_class.strip().upper()
+        if fault_class in {"", "NORMAL"}:
+            return I3Recommendation.normal()
+        if (result.fault_confidence or 0.0) >= 0.8:
+            return I3Recommendation(I3Risk.BLOCKING, f"i3:{fault_class}", I3Action.BLOCK_FINAL)
+        return I3Recommendation(I3Risk.WARNING, f"i3:{fault_class}", I3Action.WARN)
+
+    @staticmethod
+    def _enhanced_fallback(result: FramePointResult, error: Exception) -> FramePointResult:
+        """Keep the original I1 final value and validity if enhanced processing fails."""
+
+        baseline = I1BaselineView.from_result(result)
+        if baseline.valid:
+            return replace(
+                result,
+                final_valid=True,
+                proposed_decision=FinalDecision.REJECT.value,
+                committed_decision=FinalDecision.ACCEPT_WITH_WARNING.value,
+                write_committed=False,
+                result_source=ResultSource.I1_BASELINE.value,
+                final_decision_reason=f"enhanced_exception_fallback:{type(error).__name__}",
+            )
+        return replace(
+            result,
+            final_valid=False,
+            proposed_decision=FinalDecision.REJECT.value,
+            committed_decision=FinalDecision.REJECT.value,
+            write_committed=False,
+            result_source=ResultSource.REJECTED.value,
+            final_decision_reason=f"enhanced_exception_invalid_baseline:{type(error).__name__}",
+        )
+
+    def _apply_final_decision(
+        self,
+        result: FramePointResult,
+        decision: ArbitrationDecision,
+    ) -> FramePointResult:
+        """Atomically apply an already-authorized experimental final decision.
+
+        The arbitrator itself is pure.  This method is intentionally the only
+        Phase 4 location that can alter the final coordinate view.
+        """
+
+        if not decision.write_committed:
+            return result
+        if not decision.authority.may_write_final:
+            raise PermissionError("experimental authority is required for final writes")
+        if decision.committed_decision is FinalDecision.USE_CORRECTED:
+            xyz = decision.final_xyz_m
+            if (
+                not decision.final_valid
+                or decision.result_source is not ResultSource.I2_CORRECTED
+                or xyz is None
+                or not np.isfinite(np.asarray(xyz, dtype=float)).all()
+            ):
+                raise ValueError("invalid corrected final commit")
+            final_distance = float(np.linalg.norm(np.asarray(xyz, dtype=float)))
+            return replace(
+                result,
+                final_x_m=float(xyz[0]),
+                final_y_m=float(xyz[1]),
+                final_z_m=float(xyz[2]),
+                final_distance_m=final_distance,
+                final_valid=True,
+                proposed_decision=decision.proposed_decision.value,
+                committed_decision=decision.committed_decision.value,
+                write_committed=True,
+                result_source=decision.result_source.value,
+                final_decision_reason=decision.reason,
+            )
+        if decision.committed_decision is FinalDecision.REJECT:
+            if decision.final_valid or decision.result_source is not ResultSource.REJECTED:
+                raise ValueError("invalid reject final commit")
+            return replace(
+                result,
+                status="rejected",
+                final_x_m=None,
+                final_y_m=None,
+                final_z_m=None,
+                final_distance_m=None,
+                final_valid=False,
+                proposed_decision=decision.proposed_decision.value,
+                committed_decision=decision.committed_decision.value,
+                write_committed=False,
+                result_source=decision.result_source.value,
+                final_decision_reason=decision.reason,
+            )
+        raise ValueError("only corrected or rejected decisions may write a final result")
+
+    def _accuracy_geometry(self) -> tuple[float, float]:
+        focal_length_px = abs(float(self.q[2, 3]))
+        inverse_baseline = abs(float(self.q[3, 2]))
+        if focal_length_px <= 0.0 or inverse_baseline <= 0.0:
+            raise ValueError("target-accuracy policy requires a standard finite Q geometry")
+        baseline = 1.0 / inverse_baseline
+        baseline_mm = baseline * 1000.0 if self.calibration_unit == "m" else baseline
+        return focal_length_px, baseline_mm
+
+    def _pre_match_accuracy_policy(
+        self,
+        state: PointState,
+        base_search_radius_px: int,
+    ) -> MeasurementPolicyDecision | None:
+        if self.target_accuracy_spec is None:
+            return None
+        xyz = state.estimated_xyz or state.xyz
+        if xyz is None or not np.isfinite(xyz[2]) or xyz[2] <= 0.0:
+            return None
+        variance = (
+            state.last_disparity_variance_px2
+            if state.last_disparity_variance_px2 is not None
+            else self.config.uncertainty_base_disparity_variance_px2
+        )
+        focal_length_px, baseline_mm = self._accuracy_geometry()
+        plan = build_precision_plan(
+            self.target_accuracy_spec,
+            current_depth_m=float(xyz[2]),
+            focal_length_px=focal_length_px,
+            baseline_mm=baseline_mm,
+            estimated_sigma_disparity_px=float(np.sqrt(variance)),
+            minimum_achievable_sigma_disparity_px=float(
+                np.sqrt(self.config.uncertainty_min_disparity_variance_px2)
+            ),
+        )
+        return decide_measurement_policy(
+            plan,
+            base_search_radius_px=base_search_radius_px,
+            vision_state=state.confidence_state,
+            max_precision_retry=self.config.max_precision_retry,
+            max_refinement_level=self.config.max_precision_refinement_level,
+        )
+
+    def _match_accuracy_policy(
+        self,
+        match: LocalMatchResult,
+        state: PointState,
+        *,
+        base_search_radius_px: int,
+        flow_fb_error_px: float | None,
+        right_flow_fb_error_px: float | None,
+        precision_retry_count: int,
+    ) -> MeasurementPolicyDecision | None:
+        if self.target_accuracy_spec is None or match.disparity is None:
+            return None
+        disparity = float(
+            match.measured_disparity
+            if match.measured_disparity is not None
+            else match.raw_disparity
+            if match.raw_disparity is not None
+            else match.disparity
+        )
+        try:
+            xyz = reproject_point_m(
+                state.left_xy[0], state.left_xy[1], disparity,
+                self.q, self.calibration_unit,
+            )
+        except ValueError:
+            return None
+        uncertainty = estimate_match_uncertainty(
+            texture_std=match.texture_std,
+            photo_cost=match.cost,
+            uniqueness_margin=match.uniqueness_margin_value,
+            cost_curvature=match.cost_curvature,
+            flow_fb_error_px=flow_fb_error_px,
+            right_flow_fb_error_px=right_flow_fb_error_px,
+            lr_error_px=match.lr_error_px,
+            cycle_error_px=match.cycle_error_px,
+            icgn_residual=match.icgn_residual,
+            icgn_hessian=match.icgn_hessian,
+            config=self.config,
+            icgn_hessian_density=match.icgn_hessian_density,
+            neighbor_disparity_mad=match.neighbor_disparity_mad,
+        )
+        focal_length_px, baseline_mm = self._accuracy_geometry()
+        plan = build_precision_plan(
+            self.target_accuracy_spec,
+            current_depth_m=float(xyz[2]),
+            focal_length_px=focal_length_px,
+            baseline_mm=baseline_mm,
+            estimated_sigma_disparity_px=float(
+                np.sqrt(uncertainty.disparity_variance_px2)
+            ),
+            minimum_achievable_sigma_disparity_px=float(
+                np.sqrt(self.config.uncertainty_min_disparity_variance_px2)
+            ),
+        )
+        return decide_measurement_policy(
+            plan,
+            base_search_radius_px=base_search_radius_px,
+            vision_state=state.confidence_state,
+            max_precision_retry=self.config.max_precision_retry,
+            max_refinement_level=self.config.max_precision_refinement_level,
+            precision_retry_count=precision_retry_count,
+        )
+
+    def _annotate_accuracy_policy(
+        self,
+        result: FramePointResult,
+        *,
+        base_search_radius_px: int,
+        precision_retry_count: int,
+        warmup: bool,
+    ) -> FramePointResult:
+        if self.target_accuracy_spec is None:
+            return result
+        depth_m = next(
+            (
+                float(value)
+                for value in (result.estimated_z_m, result.measured_z_m, result.z_m)
+                if value is not None and np.isfinite(value) and value > 0.0
+            ),
+            None,
+        )
+        common = {
+            "accuracy_policy_enabled": True,
+            "precision_policy_warmup": warmup,
+            "target_metric": self.target_accuracy_spec.metric,
+            "target_x_mm": self.target_accuracy_spec.target_sigma_x_mm,
+            "target_y_mm": self.target_accuracy_spec.target_sigma_y_mm,
+            "target_z_mm": self.target_accuracy_spec.target_sigma_z_mm,
+            "policy_base_search_radius_px": base_search_radius_px,
+            "policy_precision_retry_count": precision_retry_count,
+        }
+        if depth_m is None:
+            return replace(
+                result,
+                **common,
+                precision_feasible=False,
+                precision_status="UNAVAILABLE",
+                limiting_axis="z",
+                policy_final_search_radius_px=base_search_radius_px,
+                policy_refinement_level=0,
+                policy_retry_budget=0,
+                policy_acceptance_reason="stereo_measurement_unavailable",
+                policy_reason="causal_depth_unavailable",
+            )
+        focal_length_px, baseline_mm = self._accuracy_geometry()
+        estimated_sigma_d = (
+            float(np.sqrt(result.disparity_variance_px2))
+            if result.disparity_variance_px2 is not None
+            and np.isfinite(result.disparity_variance_px2)
+            and result.disparity_variance_px2 > 0.0
+            else None
+        )
+        plan = build_precision_plan(
+            self.target_accuracy_spec,
+            current_depth_m=depth_m,
+            focal_length_px=focal_length_px,
+            baseline_mm=baseline_mm,
+            estimated_sigma_disparity_px=estimated_sigma_d,
+            minimum_achievable_sigma_disparity_px=float(
+                np.sqrt(self.config.uncertainty_min_disparity_variance_px2)
+            ),
+        )
+        decision = decide_measurement_policy(
+            plan,
+            base_search_radius_px=base_search_radius_px,
+            vision_state=result.confidence_state,
+            max_precision_retry=self.config.max_precision_retry,
+            max_refinement_level=self.config.max_precision_refinement_level,
+            precision_retry_count=precision_retry_count,
+            warmup=warmup,
+        )
+        return replace(
+            result,
+            **common,
+            required_sigma_d_px=decision.required_sigma_d_px,
+            estimated_sigma_d_px=decision.estimated_sigma_d_px,
+            estimated_sigma_x_mm=decision.estimated_sigma_x_mm,
+            estimated_sigma_y_mm=decision.estimated_sigma_y_mm,
+            estimated_sigma_z_mm=decision.estimated_sigma_z_mm,
+            precision_ratio=decision.precision_ratio,
+            precision_feasible=decision.precision_feasible,
+            precision_status=decision.precision_status,
+            limiting_axis=decision.limiting_axis,
+            policy_final_search_radius_px=decision.final_search_radius_px,
+            policy_refinement_level=decision.refinement_level,
+            policy_retry_budget=decision.retry_budget,
+            policy_acceptance_reason=decision.acceptance_reason,
+            policy_reason=decision.policy_reason,
+        )
 
     def _update_right_flow_reference(
         self,
@@ -601,14 +1274,91 @@ class TemporalStereoPipeline:
             right_reference_age_frames=0,
         )
 
+    def _determine_search_radius(
+        self,
+        state: PointState,
+        disparity_velocity: float | None,
+        recovery_attempt: bool,
+    ) -> tuple[int, str]:
+        """Innovation-1 base window: motion and prediction error only."""
+        if not self.profile.adaptive_search:
+            return self.config.search_radius, "fixed"
+        if recovery_attempt or state.status in {"lost", "recovering"}:
+            return self.config.adaptive_search_recovery_radius, "base_recovery"
+        if (
+            (disparity_velocity is None or abs(disparity_velocity) <= 1.0)
+            and (state.last_prediction_residual_px is None or state.last_prediction_residual_px <= 1.0)
+        ):
+            return self.config.adaptive_search_small_radius, "stable_prediction"
+        if disparity_velocity is not None and abs(disparity_velocity) > self.config.max_disparity_velocity * 0.5:
+            return self.config.adaptive_search_large_radius, "high_motion"
+        if state.last_prediction_residual_px is not None and state.last_prediction_residual_px > 1.0:
+            return self.config.adaptive_search_large_radius, "prediction_error"
+        return self.config.adaptive_search_normal_radius, "normal"
+
+    def _with_confidence_feedback(
+        self,
+        result: FramePointResult,
+        state: PointState,
+        *,
+        predicted_disparity: float,
+        previous_disparity: float | None,
+        disparity_velocity: float | None,
+        prediction_residual: float,
+        adaptive_radius: int,
+        radius_reason: str,
+    ) -> FramePointResult:
+        """Export interpretable confidence and advance the feedback state machine."""
+        uncertainty = estimate_match_uncertainty(
+            texture_std=result.texture_std,
+            photo_cost=result.match_cost,
+            uniqueness_margin=result.uniqueness_margin_value,
+            cost_curvature=result.cost_curvature,
+            flow_fb_error_px=result.flow_fb_error_px,
+            right_flow_fb_error_px=result.right_flow_fb_error_px,
+            lr_error_px=result.lr_error_px,
+            cycle_error_px=result.cycle_error_px,
+            icgn_residual=result.icgn_residual,
+            icgn_hessian=result.icgn_hessian,
+            config=self.config,
+            icgn_hessian_density=result.icgn_hessian_density,
+        )
+        confidence = float(np.clip(uncertainty.quality_score * np.exp(-prediction_residual / max(self.config.adaptive_search_normal_radius, 1)), 0.0, 1.0))
+        if confidence >= self.config.confidence_high_threshold:
+            confidence_state = "HIGH"
+            state.low_confidence_frames = 0
+        elif confidence >= self.config.confidence_medium_threshold:
+            confidence_state = "MEDIUM"
+            state.low_confidence_frames = 0
+        else:
+            state.low_confidence_frames += 1
+            confidence_state = "LOST" if state.low_confidence_frames >= self.config.confidence_low_to_lost_frames else "LOW"
+        state.confidence_state = confidence_state
+        components = {key: float(np.clip(1.0 - value / self.config.uncertainty_max_component, 0.0, 1.0)) for key, value in uncertainty.components.items()}
+        return replace(
+            result,
+            confidence=confidence,
+            measurement_quality_score=confidence,
+            predicted_disparity=predicted_disparity,
+            previous_disparity=previous_disparity,
+            disparity_velocity=disparity_velocity,
+            prediction_residual_px=prediction_residual,
+            adaptive_search_radius=adaptive_radius,
+            search_radius_reason=radius_reason,
+            confidence_texture=components.get("texture"), confidence_photo=components.get("photo"),
+            confidence_margin=components.get("margin"), confidence_flow=components.get("flow"),
+            confidence_lr=components.get("lr"), confidence_cycle=components.get("cycle"),
+            confidence_icgn=components.get("icgn"), confidence_curvature=components.get("curvature"),
+            confidence_temporal=float(np.exp(-prediction_residual / max(self.config.adaptive_search_normal_radius, 1))),
+            confidence_total=confidence,
+            confidence_state=confidence_state,
+        )
+
     def _apply_camera_compensation(
         self,
         results: list[FramePointResult],
     ) -> list[FramePointResult]:
-        if not (
-            self.profile.use_camera_compensation
-            and self.config.enable_camera_compensation
-        ):
+        if not (self.profile.use_camera_compensation and self.config.enable_camera_compensation) or self.config.camera_compensation_mode == "none":
             return results
         reference_results: list[FramePointResult] = []
         current_points: list[tuple[float, float, float]] = []
@@ -632,7 +1382,15 @@ class TemporalStereoPipeline:
             initial_points.append(state.reference_estimated_xyz)
             variance = state.last_disparity_variance_px2 or 1.0
             weights.append(max(state.confidence, 1e-3) / max(variance, 1e-9))
-        if current_points:
+        if self.config.camera_compensation_mode == "single_reference" and current_points:
+            current = np.asarray(current_points[0], dtype=np.float64)
+            initial = np.asarray(initial_points[0], dtype=np.float64)
+            translation = initial - current
+            compensation = CameraCompensationResult(
+                "single_reference", np.eye(3), translation,
+                (reference_results[0].point_id,), 0.0,
+            )
+        elif current_points:
             compensation = estimate_camera_compensation(
                 np.asarray(current_points, dtype=np.float64),
                 np.asarray(initial_points, dtype=np.float64),
@@ -650,7 +1408,7 @@ class TemporalStereoPipeline:
             )
         reference_count = len(reference_results)
         applied = (
-            compensation.status == "valid"
+            compensation.status in {"valid", "single_reference"}
             and compensation.rotation is not None
             and compensation.translation_m is not None
         )
@@ -665,9 +1423,11 @@ class TemporalStereoPipeline:
                 )
             )
             translation_mm = compensation.translation_m * 1000.0
+            rotation_xyz_deg = rotation_matrix_to_euler_xyz_deg(compensation.rotation)
         else:
             rotation_angle = None
             translation_mm = np.asarray([None, None, None], dtype=object)
+            rotation_xyz_deg = (None, None, None)
 
         processed: list[FramePointResult] = []
         for result in results:
@@ -722,6 +1482,9 @@ class TemporalStereoPipeline:
                     camera_ty_mm=translation_mm[1],
                     camera_tz_mm=translation_mm[2],
                     camera_rotation_angle_deg=rotation_angle,
+                    camera_rx_deg=rotation_xyz_deg[0],
+                    camera_ry_deg=rotation_xyz_deg[1],
+                    camera_rz_deg=rotation_xyz_deg[2],
                     compensated_x_m=(float(compensated_xyz[0]) if compensated_xyz is not None else None),
                     compensated_y_m=(float(compensated_xyz[1]) if compensated_xyz is not None else None),
                     compensated_z_m=(float(compensated_xyz[2]) if compensated_xyz is not None else None),
@@ -761,6 +1524,7 @@ class TemporalStereoPipeline:
         integer_disparity: float | None = None,
         subpixel_offset: float | None = None,
         neighbor_disparity: float | None = None,
+        neighbor_disparity_mad: float | None = None,
         used_search_radius: int = 0,
         quality_stage: str = "",
         recovery_stage: str = "",
@@ -861,11 +1625,9 @@ class TemporalStereoPipeline:
         state_update_source = "measured"
         kalman_recovery_needed = False
         latest_valid = state.disparity
-        if (
-            self.profile.use_adaptive_filter
-            and self.config.enable_adaptive_filter
-        ):
-            uncertainty = estimate_match_uncertainty(
+        # Confidence is deliberately computed before Kalman/PointState mutation.
+        # Optional unavailable evidence is excluded by uncertainty.py.
+        uncertainty = estimate_match_uncertainty(
                 texture_std=texture_std,
                 photo_cost=match_cost,
                 uniqueness_margin=uniqueness_margin_value,
@@ -878,47 +1640,73 @@ class TemporalStereoPipeline:
                 icgn_hessian=icgn_hessian,
                 config=self.config,
                 icgn_hessian_density=icgn_hessian_density,
+                neighbor_disparity_mad=neighbor_disparity_mad,
             )
-            left_variance_px2 = uncertainty.left_position_variance_px2
-            disparity_variance_px2 = uncertainty.disparity_variance_px2
-            measurement_quality_score = uncertainty.quality_score
+        prediction_residual = abs(measured - (state.latest_disparity or measured))
+        score = float(np.clip(uncertainty.quality_score * np.exp(-prediction_residual / max(self.config.adaptive_search_normal_radius, 1)), 0.0, 1.0))
+        decision_mode = self.config.confidence_mode if self.profile.use_confidence_feedback else "none"
+        decision, state.low_confidence_frames = decide_confidence(
+            score, state.low_confidence_frames,
+            high=self.config.confidence_high_threshold, medium=self.config.confidence_medium_threshold,
+            low=self.config.confidence_low_threshold, lost_after=self.config.confidence_low_to_lost_frames,
+            mode=decision_mode, uniqueness_margin=uniqueness_margin_value,
+            single_margin_reference=self.config.uncertainty_margin_reference,
+        )
+        state.confidence_state = decision.state
+        state.last_prediction_residual_px = prediction_residual
+        left_variance_px2 = uncertainty.left_position_variance_px2
+        disparity_variance_px2 = uncertainty.disparity_variance_px2
+        measurement_quality_score = score
+        measurement_accepted_for_state = decision.accept_measurement
+        state_update_source = "measured" if decision.accept_measurement else "predicted"
+        if self.config.confidence_mode in {"single_margin", "lr_only", "multi_reject"} and not decision.accept_measurement:
+            return replace(
+                FramePointResult(
+                    method=self.method, frame=frame, point_id=state.point_id,
+                    status="confidence_rejected", left_x=state.left_xy[0], left_y=state.left_xy[1],
+                    measured_right_x=right_xy[0], measured_right_y=right_xy[1],
+                    measured_disparity=measured, match_cost=match_cost, lr_error_px=lr_error,
+                    confidence=score, measurement_accepted_for_state=False,
+                    state_update_source="rejected", measurement_quality_score=score,
+                    confidence_total=score, confidence_state=decision.state,
+                    neighbor_disparity_mad=neighbor_disparity_mad,
+                ),
+                recovery_stage=recovery_stage,
+            )
+        use_confidence_filter = self.profile.use_confidence_feedback and self.config.confidence_mode == "closed_loop"
+        if (self.profile.use_adaptive_filter or use_confidence_filter) and self.config.enable_adaptive_filter:
             point_filter = self.filters.get(state.point_id)
             if point_filter is None:
-                point_filter = AdaptivePointKalman(self.config)
-                point_filter.initialize(state.left_xy, measured)
-                self.filters[state.point_id] = point_filter
-                kalman_update_status = "initialized"
+                if decision.accept_measurement:
+                    point_filter = AdaptivePointKalman(self.config)
+                    point_filter.initialize(state.left_xy, measured)
+                    self.filters[state.point_id] = point_filter
+                    kalman_update_status = "initialized"
+                else:
+                    kalman_update_status = "not_initialized_rejected"
             else:
                 point_filter.predict()
-                update = point_filter.update(
-                    state.left_xy,
-                    measured,
-                    left_variance_px2,
-                    disparity_variance_px2,
-                )
-                estimated_left_xy = update.estimated_left_xy
-                estimated = update.estimated_disparity
-                kalman_innovation = update.innovation
-                kalman_innovation_norm = update.innovation_norm
-                kalman_gain_disparity = update.kalman_gain_disparity
-                kalman_nis = update.nis
-                kalman_update_status = update.status
+                if decision.accept_measurement:
+                    update = point_filter.update(state.left_xy, measured, left_variance_px2, disparity_variance_px2)
+                    estimated_left_xy, estimated = update.estimated_left_xy, update.estimated_disparity
+                    kalman_innovation, kalman_innovation_norm = update.innovation, update.innovation_norm
+                    kalman_gain_disparity, kalman_nis, kalman_update_status = update.kalman_gain_disparity, update.nis, update.status
+                    measurement_accepted_for_state = update.status in {"updated", "variance_inflated"}
+                else:
+                    estimated_left_xy, estimated = point_filter.current_measurement_state()
+                    kalman_update_status = "predict_only_confidence"
+                    point_filter.predict_only_frames += 1
                 kalman_predict_only_frames = point_filter.predict_only_frames
-                measurement_accepted_for_state = update.status in {
-                    "updated",
-                    "variance_inflated",
-                }
                 state_update_source = (
                     "filtered" if measurement_accepted_for_state else "predicted"
                 )
                 kalman_recovery_needed = (
-                    update.status == "predict_only_outlier"
-                    and point_filter.predict_only_frames
-                    >= self.config.kalman_max_predict_only_frames
+                    (not measurement_accepted_for_state)
+                    and point_filter.predict_only_frames >= self.config.kalman_max_predict_only_frames
                 )
-                state.last_kalman_innovation = update.innovation_norm
-                state.last_kalman_gain_disparity = update.kalman_gain_disparity
-                state.last_nis = update.nis
+                state.last_kalman_innovation = kalman_innovation_norm
+                state.last_kalman_gain_disparity = kalman_gain_disparity
+                state.last_nis = kalman_nis
             state.last_left_variance_px2 = left_variance_px2
             state.last_disparity_variance_px2 = disparity_variance_px2
         elif (
@@ -966,7 +1754,7 @@ class TemporalStereoPipeline:
         measured_xyz = tuple(float(value) for value in measured_xyz_array)
         estimated_xyz = tuple(float(value) for value in estimated_xyz_array)
         was_recovering = (
-            self.method in {"full_quality", "research_full"}
+            (self.profile.adaptive_search or self.profile.use_confidence_feedback or self.method == "full_quality")
             and self.config.enable_recovery
             and state.status in {"recovering", "lost"}
         )
@@ -1000,13 +1788,16 @@ class TemporalStereoPipeline:
                 frame=frame,
                 quality_stage=quality_stage,
             )
-        state.confirm_valid(confidence)
-        if kalman_recovery_needed:
+        state.confirm_valid(score)
+        if decision.state == "LOST":
+            state.status = "lost"
+        elif decision.trigger_recovery or kalman_recovery_needed:
             state.status = "recovering"
             if state.recovery_started_frame is None:
                 state.recovery_started_frame = frame
         if was_recovering and measurement_accepted_for_state:
             state.confirm_recovery(frame)
+            state.confidence_state = "MEDIUM"
         reference = state.reference_estimated_xyz or estimated_xyz
         delta_mm = tuple(
             (estimated_xyz[index] - reference[index]) * 1000.0
@@ -1049,6 +1840,7 @@ class TemporalStereoPipeline:
             delta_z_mm=delta_mm[2],
             subpixel_offset=subpixel_offset,
             neighbor_disparity=neighbor_disparity,
+            neighbor_disparity_mad=neighbor_disparity_mad,
             used_search_radius=used_search_radius,
             quality_stage=quality_stage,
             recovery_stage=recovery_stage,
@@ -1097,6 +1889,18 @@ class TemporalStereoPipeline:
             left_variance_px2=left_variance_px2,
             disparity_variance_px2=disparity_variance_px2,
             measurement_quality_score=measurement_quality_score,
+            confidence_texture=_confidence_component(uncertainty.components.get("texture"), self.config),
+            confidence_photo=_confidence_component(uncertainty.components.get("photo"), self.config),
+            confidence_margin=_confidence_component(uncertainty.components.get("margin"), self.config),
+            confidence_flow=_confidence_component(uncertainty.components.get("flow"), self.config),
+            confidence_lr=_confidence_component(uncertainty.components.get("lr"), self.config),
+            confidence_cycle=_confidence_component(uncertainty.components.get("cycle"), self.config),
+            confidence_icgn=_confidence_component(uncertainty.components.get("icgn"), self.config),
+            confidence_curvature=_confidence_component(uncertainty.components.get("curvature"), self.config),
+            confidence_neighbor=_confidence_component(uncertainty.components.get("neighbor"), self.config),
+            confidence_temporal=float(np.exp(-prediction_residual / max(self.config.adaptive_search_normal_radius, 1))),
+            confidence_total=score,
+            confidence_state=decision.state,
             kalman_innovation_u=kalman_innovation[0],
             kalman_innovation_v=kalman_innovation[1],
             kalman_innovation_d=kalman_innovation[2],
