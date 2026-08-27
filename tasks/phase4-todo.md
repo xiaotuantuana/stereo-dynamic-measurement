@@ -4,5 +4,5 @@
 - [x] 2. Innovation 2 state isolation
 - [x] 3. Controlled pipeline integration
 - [x] 4. Structured Innovation 3 smoke
-- [ ] 5. Controlled validation and 500-frame gate
-- [ ] Full regression and Phase 4 report
+- [x] 5. Controlled validation and 500-frame gate
+- [x] Full regression and Phase 4 report
