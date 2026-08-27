@@ -114,10 +114,22 @@ class EnhancedPointProcessor:
             return self._confirmed_anomaly(observation, raw, prediction)
 
         if self.state is I2State.QUARANTINED:
-            return self._recover_clean_observation(observation, raw, prediction)
+            return self._quarantine(
+                observation,
+                raw,
+                prediction,
+                CandidateSafety.unavailable("quarantine_unresolved"),
+                "quarantine_unresolved",
+            )
 
         if self.state is I2State.RECOVERY:
-            return self._recover_clean_observation(observation, raw, prediction)
+            return self._quarantine(
+                observation,
+                raw,
+                prediction,
+                CandidateSafety.unavailable("recovery_invalidated"),
+                "recovery_invalidated",
+            )
 
         if evidence.suspicious and not evidence.legitimate_motion:
             self.state = I2State.SUSPECT

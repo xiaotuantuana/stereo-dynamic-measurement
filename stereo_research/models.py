@@ -991,6 +991,7 @@ class FramePointResult:
     write_committed: bool | None = None
     result_source: str = ""
     final_decision_reason: str = ""
+    i1_status: str = ""
     i2_state: str = ""
     i2_episode_id: int | None = None
     i2_prediction_x_m: float | None = None

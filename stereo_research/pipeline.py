@@ -884,6 +884,7 @@ class TemporalStereoPipeline:
             prediction = outcome.prediction_xyz_mm
             audited = replace(
                 result,
+                i1_status=baseline.status,
                 i2_state=outcome.state.value,
                 i2_episode_id=outcome.episode_id,
                 i2_prediction_x_m=(None if prediction is None else prediction[0] / 1000.0),
@@ -921,6 +922,8 @@ class TemporalStereoPipeline:
             return I3Recommendation.normal()
         if (result.fault_confidence or 0.0) >= 0.8:
             return I3Recommendation(I3Risk.BLOCKING, f"i3:{fault_class}", I3Action.BLOCK_FINAL)
+        if fault_class == "STEREO_MISMATCH":
+            return I3Recommendation(I3Risk.WARNING, f"i3:{fault_class}", I3Action.ALLOW_CORRECTION)
         return I3Recommendation(I3Risk.WARNING, f"i3:{fault_class}", I3Action.WARN)
 
     @staticmethod

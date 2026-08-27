@@ -35,6 +35,7 @@ class I3Risk(str, Enum):
 
 class I3Action(str, Enum):
     NONE = "NONE"
+    ALLOW_CORRECTION = "ALLOW_CORRECTION"
     WARN = "WARN"
     BLOCK_FINAL = "BLOCK_FINAL"
 
@@ -47,7 +48,7 @@ class I3Recommendation:
 
     @classmethod
     def normal(cls) -> "I3Recommendation":
-        return cls(I3Risk.NORMAL, "normal", I3Action.NONE)
+        return cls(I3Risk.NORMAL, "normal", I3Action.ALLOW_CORRECTION)
 
 
 @dataclass(frozen=True)
@@ -243,7 +244,7 @@ class FinalArbitrator:
             return FinalDecision.REJECT
         if diagnosis.risk is I3Risk.BLOCKING:
             return FinalDecision.REJECT
-        if candidate_safety.safe:
+        if candidate_safety.safe and diagnosis.action is I3Action.ALLOW_CORRECTION:
             return FinalDecision.USE_CORRECTED
         if diagnosis.risk is I3Risk.WARNING:
             return FinalDecision.ACCEPT_WITH_WARNING

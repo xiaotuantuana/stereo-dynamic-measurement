@@ -61,6 +61,19 @@ def test_return_to_trusted_prediction_recovers_even_if_legacy_evidence_still_fla
     assert return_frame.corrected_xyz_mm is None
 
 
+def test_continuous_outlier_stays_quarantined_when_legacy_evidence_temporarily_weakens() -> None:
+    processor = EnhancedPointProcessor(max_authorized_correction_mm=100.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    processor.process(_observation(2, 60.0, confirmed_anomaly=True))
+
+    unresolved = processor.process(_observation(3, 60.0, confirmed_anomaly=False))
+
+    assert unresolved.state is I2State.QUARANTINED
+    assert unresolved.trusted_committed is False
+    assert [item.frame for item in processor.trusted_history] == [0, 1]
+
+
 def test_raw_and_corrected_histories_never_drive_prediction() -> None:
     processor = EnhancedPointProcessor(max_authorized_correction_mm=100.0)
     processor.process(_observation(0, 0.0))

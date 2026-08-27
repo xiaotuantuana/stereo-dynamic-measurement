@@ -7,6 +7,7 @@ from stereo_research.final_arbitration import (
     FinalDecision,
     I1BaselineView,
     I3Recommendation,
+    I3Action,
     I3Risk,
     ResultSource,
 )
@@ -137,3 +138,21 @@ def test_candidate_safety_is_derived_and_audits_failed_gates() -> None:
     assert "candidate_not_finite" in safety.failed_reasons
     assert "geometry_invalid" in safety.failed_reasons
     assert "correction_unauthorized" in safety.failed_reasons
+
+
+def test_i3_warning_without_explicit_correction_permission_keeps_i1_baseline() -> None:
+    decision = FinalArbitrator().decide(
+        baseline=I1BaselineView.from_result(_baseline_result()),
+        candidate_safety=_safe_candidate(),
+        diagnosis=I3Recommendation(
+            risk=I3Risk.WARNING,
+            reason="occlusion risk",
+            action=I3Action.WARN,
+        ),
+        authority=ExperimentAuthority.full_experiment(write_enabled=True),
+    )
+
+    assert decision.proposed_decision is FinalDecision.ACCEPT_WITH_WARNING
+    assert decision.committed_decision is FinalDecision.ACCEPT_WITH_WARNING
+    assert decision.result_source is ResultSource.I1_BASELINE
+    assert decision.write_committed is False
