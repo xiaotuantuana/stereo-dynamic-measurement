@@ -164,6 +164,19 @@ def apply_rigid_transform(
     return transformed
 
 
+def rotation_matrix_to_euler_xyz_deg(rotation: np.ndarray) -> tuple[float, float, float]:
+    """Return intrinsic XYZ Euler angles in degrees for the logged rigid transform."""
+    matrix = np.asarray(rotation, dtype=np.float64)
+    if matrix.shape != (3, 3):
+        raise ValueError("rotation must have shape (3, 3)")
+    sy = float(np.hypot(matrix[0, 0], matrix[1, 0]))
+    if sy > 1e-8:
+        x, y, z = np.arctan2(matrix[2, 1], matrix[2, 2]), np.arctan2(-matrix[2, 0], sy), np.arctan2(matrix[1, 0], matrix[0, 0])
+    else:
+        x, y, z = np.arctan2(-matrix[1, 2], matrix[1, 1]), np.arctan2(-matrix[2, 0], sy), 0.0
+    return tuple(float(value) for value in np.degrees([x, y, z]))
+
+
 def _validated_points(
     current_points: np.ndarray,
     reference_points: np.ndarray,

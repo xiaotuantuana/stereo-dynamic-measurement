@@ -7,14 +7,26 @@ import numpy as np
 
 @dataclass(frozen=True)
 class FaultFingerprint:
-    gradient_quality: float = 1.0; blur_score: float = 1.0
-    lr_residual: float = 0.0; epipolar_residual: float = 0.0; matching_cost_residual: float = 0.0; neighbor_residual: float = 0.0
-    flow_residual: float = 0.0; fb_error: float = 0.0; temporal_residual: float = 0.0
-    reference_motion_residual: float = 0.0; geometry_health_residual: float = 0.0; physics_residual: float = 0.0
-    common_target_motion_ratio: float = 0.0; tracking_loss_residual: float = 0.0
+    gradient_quality: float | None = None
+    blur_score: float | None = None
+    lr_residual: float | None = None
+    epipolar_residual: float | None = None
+    matching_cost_residual: float | None = None
+    neighbor_residual: float | None = None
+    flow_residual: float | None = None
+    fb_error: float | None = None
+    temporal_residual: float | None = None
+    reference_motion_residual: float | None = None
+    geometry_health_residual: float | None = None
+    physics_residual: float | None = None
+    common_target_motion_ratio: float | None = None
+    tracking_loss_residual: float | None = None
 
     def __post_init__(self) -> None:
-        if not all(np.isfinite(value) for value in self.__dict__.values()):
-            raise ValueError("FaultFingerprint fields must be finite")
-        if not 0 <= self.gradient_quality <= 1 or not 0 <= self.blur_score <= 1 or not 0 <= self.physics_residual <= 1:
-            raise ValueError("quality/blur/physics residual must lie in [0,1]")
+        supplied = [value for value in self.__dict__.values() if value is not None]
+        if not all(np.isfinite(value) for value in supplied):
+            raise ValueError("supplied FaultFingerprint fields must be finite")
+        for name in ("gradient_quality", "blur_score", "physics_residual", "common_target_motion_ratio"):
+            value = getattr(self, name)
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must lie in [0,1] when available")

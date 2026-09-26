@@ -1,0 +1,9 @@
+{
+  "case_count": 160,
+  "accuracy": 1.0,
+  "macro_f1": 1.0,
+  "false_positive_rate": 0.0,
+  "recovery_success_rate": 1.0,
+  "rmse_before": 2.142857142857143,
+  "rmse_after": 0.0
+}

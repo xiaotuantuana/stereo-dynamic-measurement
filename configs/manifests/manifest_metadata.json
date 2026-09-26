@@ -1,0 +1,10 @@
+{
+  "seed": 20260827,
+  "development_source_split": "train",
+  "development_count": 500,
+  "validation_source_split": "val",
+  "validation_count": 500,
+  "independent_test_available": false,
+  "scene_disjoint": false,
+  "scene_disjoint_reason": "source subset is flattened and contains no scene identity"
+}

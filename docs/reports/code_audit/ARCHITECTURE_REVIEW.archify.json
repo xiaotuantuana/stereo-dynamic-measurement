@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "双目动态测量工程：已验证代码架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "production-path",
+        "label": "GUI 运行路径",
+        "focus": ["video", "gui", "pipeline", "i1", "guiOutput"],
+        "note": "视频处理器构造核心时序管线；该路径当前仅直接接入 I1 精度规划。"
+      },
+      {
+        "id": "experiment-path",
+        "label": "离线评估路径",
+        "focus": ["manifest", "benchmark", "pipeline"],
+        "note": "基准运行器以数据清单驱动同一个核心时序管线，并写出可追溯结果。"
+      },
+      {
+        "id": "fault-path",
+        "label": "故障验证路径",
+        "focus": ["fault", "orchestrator", "i3"],
+        "note": "故障基准通过编排器诊断与恢复；它是与核心时序管线并列的验证路径。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "video",
+      "type": "external",
+      "label": "双目视频 / 相机输入",
+      "sublabel": "GUI ProcessingRequest.video_path",
+      "pos": [40, 320],
+      "size": [160, 64]
+    },
+    {
+      "id": "manifest",
+      "type": "external",
+      "label": "数据清单与标定文件",
+      "sublabel": "DatasetSample / calibration",
+      "pos": [270, 550],
+      "size": [160, 64]
+    },
+    {
+      "id": "gui",
+      "type": "frontend",
+      "label": "桌面 GUI 视频处理器",
+      "sublabel": "StereoVideoProcessor",
+      "pos": [260, 320],
+      "size": [170, 64]
+    },
+    {
+      "id": "benchmark",
+      "type": "backend",
+      "label": "离线基准运行器",
+      "sublabel": "experiment.benchmark.runner",
+      "pos": [500, 550],
+      "size": [170, 64]
+    },
+    {
+      "id": "pipeline",
+      "type": "backend",
+      "label": "核心时序双目管线",
+      "sublabel": "TemporalStereoPipeline",
+      "tag": "共享运行时核心",
+      "pos": [500, 320],
+      "size": [190, 70]
+    },
+    {
+      "id": "i1",
+      "type": "backend",
+      "label": "创新点一：精度规划",
+      "sublabel": "precision_planner",
+      "pos": [750, 320],
+      "size": [180, 64]
+    },
+    {
+      "id": "fault",
+      "type": "backend",
+      "label": "故障注入基准",
+      "sublabel": "benchmark_faults.run_fault_benchmark",
+      "pos": [30, 720],
+      "size": [180, 64]
+    },
+    {
+      "id": "orchestrator",
+      "type": "backend",
+      "label": "故障诊断与恢复编排器",
+      "sublabel": "StereoMeasurementOrchestrator",
+      "pos": [280, 720],
+      "size": [190, 64]
+    },
+    {
+      "id": "i3",
+      "type": "backend",
+      "label": "创新点三：恢复策略",
+      "sublabel": "RuleDiagnosticEngine + RecoveryManager",
+      "pos": [550, 720],
+      "size": [180, 64]
+    },
+    {
+      "id": "guiOutput",
+      "type": "database",
+      "label": "GUI 测量结果",
+      "sublabel": "逐帧 CSV",
+      "pos": [260, 90],
+      "size": [190, 64]
+    }
+  ],
+  "connections": [
+    {"id": "video-gui", "from": "video", "to": "gui", "label": "视频帧", "variant": "emphasis"},
+    {"id": "gui-pipeline", "from": "gui", "to": "pipeline", "label": "initialize / step", "variant": "emphasis", "labelAt": [465, 404]},
+    {"id": "pipeline-i1", "from": "pipeline", "to": "i1", "label": "精度策略"},
+    {"id": "gui-output", "from": "gui", "to": "guiOutput", "label": "逐帧 CSV", "fromSide": "top", "toSide": "bottom"},
+    {"id": "manifest-benchmark", "from": "manifest", "to": "benchmark", "label": "样本与 GT"},
+    {"id": "benchmark-pipeline", "from": "benchmark", "to": "pipeline", "label": "评估调用", "fromSide": "top", "toSide": "bottom"},
+    {"id": "fault-orchestrator", "from": "fault", "to": "orchestrator", "label": "观测与重测", "variant": "emphasis"},
+    {"id": "orchestrator-i3", "from": "orchestrator", "to": "i3", "label": "诊断与恢复"}
+  ],
+  "cards": [
+    {"dot": "cyan", "title": "已验证共享核心", "items": ["GUI 与离线基准均直接构造 TemporalStereoPipeline。", "核心管线直接导入 I1 的精度规划能力。"]},
+    {"dot": "amber", "title": "架构审查重点", "items": ["I2 轨迹校正模块未出现在此已验证运行时连接图中，应明确其接入点或独立实验身份。", "I3 故障编排器由故障基准驱动，未证明已进入 GUI 或核心时序管线。"]},
+    {"dot": "violet", "title": "可追溯性", "items": ["基准运行器保存配置、数据集信息、环境、逐样本指标和失败样本。", "GUI 直接写 CSV，但与离线基准的统一结果契约值得评估。"]}
+  ]
+}

@@ -148,6 +148,26 @@ def test_full_enhanced_finalizer_uses_trusted_prediction_for_safe_candidate() ->
     assert corrected.write_committed is True
 
 
+def test_post_correction_safety_requires_an_accepted_i1_measurement_not_a_constant() -> None:
+    pipeline = _pipeline()
+    pipeline._process_enhanced_results([_enhanced_result(0, 0.0)])
+    pipeline._process_enhanced_results([_enhanced_result(1, 0.0)])
+
+    unaccepted = pipeline._process_enhanced_results([
+        FramePointResult(
+            **{
+                **_enhanced_result(2, 0.080, anomaly=True).__dict__,
+                "measurement_accepted_for_state": False,
+            }
+        )
+    ])[0]
+
+    assert unaccepted.candidate_safe is False
+    assert "post_correction_unsafe" in unaccepted.candidate_safety_reasons
+    assert unaccepted.committed_decision == "ACCEPT_WITH_WARNING"
+    assert unaccepted.write_committed is False
+
+
 def test_shadow_authority_keeps_baseline_final_while_recording_proposal() -> None:
     pipeline = TemporalStereoPipeline(
         "M3",
@@ -177,6 +197,19 @@ def test_i3_structured_recommendation_does_not_mutate_measurement_result() -> No
     assert result.as_csv_row() == before
 
 
+def test_structured_occlusion_policy_keeps_baseline_without_explicit_permission() -> None:
+    result = FramePointResult(**{
+        **_enhanced_result(2, 0.080, anomaly=True).__dict__,
+        "fault_class": "OCCLUSION",
+        "fault_confidence": 0.65,
+    })
+
+    recommendation = TemporalStereoPipeline._structured_i3_recommendation(result, hard_failure=False)
+
+    assert recommendation.risk is I3Risk.WARNING
+    assert recommendation.action.value == "WARN"
+
+
 def test_blocking_i3_recommendation_rejects_even_with_safe_i2_candidate() -> None:
     pipeline = _pipeline()
     pipeline._process_enhanced_results([_enhanced_result(0, 0.0)])
@@ -193,6 +226,7 @@ def test_blocking_i3_recommendation_rejects_even_with_safe_i2_candidate() -> Non
 
     assert blocked.proposed_decision == "REJECT"
     assert blocked.committed_decision == "REJECT"
+    assert blocked.write_committed is True
     assert blocked.final_valid is False
     assert blocked.status == "rejected"
 
@@ -250,6 +284,8 @@ def test_full_enhanced_smoke_produces_i1_i2_i3_and_final_diagnostics_per_frame()
 
     for result in (first, second):
         assert result.i2_state
+        assert result.i2_trusted_committed is not None
+        assert result.i2_reason
         assert result.proposed_decision
         assert result.committed_decision
         assert result.result_source

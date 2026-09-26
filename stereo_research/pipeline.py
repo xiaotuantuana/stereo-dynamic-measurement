@@ -856,13 +856,19 @@ class TemporalStereoPipeline:
                 and result.c_phy is not None
                 and result.c_phy < 0.55
             )
+            # This is an I1 structural-safety prerequisite only.  It is not
+            # evidence that the I2 prediction is more accurate than I1; that
+            # question belongs exclusively to Phase 4.6 candidate quality.
+            post_correction_structurally_safe = (
+                baseline.valid and bool(result.measurement_accepted_for_state)
+            )
             evidence = I2Evidence(
                 confirmed_anomaly=confirmed_anomaly,
                 legitimate_motion=bool(result.transient_protected),
                 hard_failure=hard_failure,
                 geometry_valid=baseline.valid,
                 evidence_sufficient=(result.c_phy_valid is True) if confirmed_anomaly else True,
-                post_correction_safe=True,
+                post_correction_safe=post_correction_structurally_safe,
                 suspicious=(fault_class not in {"", "NORMAL"}),
             )
             processor = self.enhanced_processors.setdefault(result.point_id, EnhancedPointProcessor())
@@ -890,6 +896,9 @@ class TemporalStereoPipeline:
                 i2_prediction_x_m=(None if prediction is None else prediction[0] / 1000.0),
                 i2_prediction_y_m=(None if prediction is None else prediction[1] / 1000.0),
                 i2_prediction_z_m=(None if prediction is None else prediction[2] / 1000.0),
+                i2_trusted_committed=outcome.trusted_committed,
+                i2_correction_applied=outcome.correction_applied,
+                i2_reason=outcome.reason,
                 candidate_safe=outcome.candidate_safety.safe,
                 candidate_safety_reasons=";".join(outcome.candidate_safety.failed_reasons),
             )
@@ -1002,7 +1011,7 @@ class TemporalStereoPipeline:
                 final_valid=False,
                 proposed_decision=decision.proposed_decision.value,
                 committed_decision=decision.committed_decision.value,
-                write_committed=False,
+                write_committed=True,
                 result_source=decision.result_source.value,
                 final_decision_reason=decision.reason,
             )

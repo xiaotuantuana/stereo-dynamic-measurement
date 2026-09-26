@@ -22,6 +22,7 @@ def main() -> None:
     result = run_baseline_distance_experiment(BaselineExperimentConfig(**values), output)
     print(f"csv: {result.csv_path}")
     print(f"plot: {result.plot_path}")
+    print(f"policy_csv: {result.policy_csv_path}")
 
 
 if __name__ == "__main__":

@@ -37,11 +37,8 @@ def evaluate_experiment(
         raw_rows[method] = rows
     if not methods:
         raise RuntimeError(f"No method CSV files found in {results_dir}")
-    sgbm_median = (
-        methods.get("sgbm", {}).get("runtime_median_ms")
-        if "sgbm" in methods
-        else methods.get("sgbm_fixed", {}).get("runtime_median_ms")
-    )
+    baseline_name = next((name for name in ("M0", "sgbm", "sgbm_fixed") if name in methods), None)
+    sgbm_median = methods.get(baseline_name, {}).get("runtime_median_ms") if baseline_name else None
     for method_summary in methods.values():
         method_median = method_summary.get("runtime_median_ms")
         method_summary["speedup_vs_sgbm"] = (
@@ -49,6 +46,7 @@ def evaluate_experiment(
             if sgbm_median is not None and method_median not in (None, 0)
             else None
         )
+        method_summary["speedup_vs_M0"] = method_summary["speedup_vs_sgbm"]
     summary = {
         "experiment": str(experiment_path),
         "ground_truth": None if gt_path is None else str(gt_path),
@@ -77,7 +75,7 @@ def _discover_ground_truth(
     manifest_path = experiment_path / "manifest.json"
     if manifest_path.exists():
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        value = payload.get("ground_truth")
+        value = payload.get("stereo_ground_truth") or payload.get("ground_truth")
         if value:
             path = Path(value)
             path = path.resolve() if path.is_absolute() else (manifest_path.parent / path).resolve()
@@ -129,6 +127,57 @@ def trajectory_series(
             [item[1] for item in values],
         )
     return series
+
+
+def _write_external_gt_displacement_plots(
+    plt: Any,
+    save: Any,
+    rows_by_method: dict[str, list[dict[str, str]]],
+    colors: list[str],
+) -> None:
+    """Plot physical GT and visual displacement from the same zero origin."""
+    for axis_name in ("X", "Y", "Z"):
+        figure, axis = plt.subplots(figsize=(6.75, 2.8))
+        error_figure, error_axis = plt.subplots(figsize=(6.75, 2.8))
+        plotted = False
+        error_plotted = False
+        for method_index, (method, rows) in enumerate(rows_by_method.items()):
+            by_point: dict[str, list[dict[str, str]]] = {}
+            for row in rows:
+                if row.get("repeat", "0") == "0" and row.get("status") == "valid":
+                    visual = _float_or_none(row.get(f"{axis_name}_m"))
+                    truth = _float_or_none(row.get(f"{axis_name}_gt"))
+                    if visual is not None and truth is not None:
+                        by_point.setdefault(str(row.get("point_id")), []).append(row)
+            for point_id, point_rows in by_point.items():
+                point_rows.sort(key=lambda row: int(row.get("frame", 0)))
+                frames = [int(row["frame"]) for row in point_rows]
+                visual = np.asarray([float(row[f"{axis_name}_m"]) for row in point_rows])
+                truth = np.asarray([float(row[f"{axis_name}_gt"]) for row in point_rows])
+                visual_delta = (visual - visual[0]) * 1000.0
+                truth_delta = (truth - truth[0]) * 1000.0
+                color = colors[method_index % len(colors)]
+                axis.plot(frames, visual_delta, color=color, linewidth=1.3, label=f"{method}:{point_id}")
+                if method_index == 0:
+                    axis.plot(frames, truth_delta, color="black", linestyle="--", linewidth=1.2, label=f"GT:{point_id}")
+                error_axis.plot(frames, visual_delta - truth_delta, color=color, linewidth=1.2, label=f"{method}:{point_id}")
+                plotted = error_plotted = True
+        axis.set_xlabel("Frame")
+        axis.set_ylabel(fr"$\Delta {axis_name}$ (mm)")
+        axis.set_title(f"External physical GT displacement: {axis_name}")
+        if plotted:
+            axis.legend(ncol=2)
+        else:
+            axis.text(0.5, 0.5, "No external GT displacement data", ha="center", va="center", transform=axis.transAxes)
+        save(figure, f"external_gt_delta_{axis_name.lower()}")
+        error_axis.set_xlabel("Frame")
+        error_axis.set_ylabel(fr"$\Delta {axis_name}_{{visual}}-\Delta {axis_name}_{{GT}}$ (mm)")
+        error_axis.set_title(f"External GT displacement error: {axis_name}")
+        if error_plotted:
+            error_axis.legend(ncol=2)
+        else:
+            error_axis.text(0.5, 0.5, "No external GT error data", ha="center", va="center", transform=error_axis.transAxes)
+        save(error_figure, f"external_gt_delta_{axis_name.lower()}_error")
 
 
 def _write_plots(
@@ -236,6 +285,8 @@ def _write_plots(
             axis.text(0.5, 0.5, "No valid displacement data", ha="center", va="center", transform=axis.transAxes)
         save(figure, name)
 
+    _write_external_gt_displacement_plots(plt, save, rows_by_method, colors)
+
     figure, axis = plt.subplots(figsize=(6.75, 2.8))
     plotted = False
     for method_index, (method, rows) in enumerate(rows_by_method.items()):
@@ -318,6 +369,25 @@ def _write_plots(
         else:
             axis.text(0.5, 0.5, "No applicable data", ha="center", va="center", transform=axis.transAxes)
         save(figure, filename)
+
+    figure, axis = plt.subplots(figsize=(7.2, 3.0))
+    confidence_fields = ("confidence_total", "confidence_texture", "confidence_flow", "confidence_lr", "confidence_temporal", "confidence_neighbor")
+    plotted = False
+    for field in confidence_fields:
+        values = [(int(row["frame"]), _float_or_none(row.get(field))) for rows in rows_by_method.values() for row in rows if str(row.get("repeat", "0")) == "0"]
+        values = [(frame, value) for frame, value in values if value is not None]
+        if values:
+            values.sort()
+            axis.plot([item[0] for item in values], [item[1] for item in values], label=field.replace("confidence_", ""), linewidth=1.0)
+            plotted = True
+    axis.set_xlabel("Frame")
+    axis.set_ylabel("Confidence (0–1)")
+    axis.set_title("Confidence components and feedback state")
+    if plotted:
+        axis.legend(ncol=3)
+    else:
+        axis.text(0.5, 0.5, "No confidence data", ha="center", va="center", transform=axis.transAxes)
+    save(figure, "confidence_components")
 
     figure, axis = plt.subplots(figsize=(6.75, 2.8))
     plotted = False

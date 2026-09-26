@@ -83,6 +83,7 @@ class EnhancedPointProcessor:
         self.corrected_history: list[XYZ | None] = []
         self.trusted_history: list[TimedObservation] = []
         self._recovery_observations: list[TimedObservation] = []
+        self._reacquisition_observations: list[TimedObservation] = []
         self._next_episode_id = 1
         self._episode_id: int | None = None
 
@@ -112,6 +113,14 @@ class EnhancedPointProcessor:
 
         if evidence.confirmed_anomaly:
             return self._confirmed_anomaly(observation, raw, prediction)
+
+        if (
+            self.state in {I2State.QUARANTINED, I2State.RECOVERY}
+            and prediction is not None
+            and self._distance(raw, prediction) > self.recovery_consistency_mm
+            and self._reacquisition_observation_is_safe(observation)
+        ):
+            return self._try_stale_reacquisition(observation, raw, prediction)
 
         if self.state is I2State.QUARANTINED:
             return self._quarantine(
@@ -163,6 +172,9 @@ class EnhancedPointProcessor:
         raw: XYZ,
         prediction: XYZ | None,
     ) -> EnhancedStateOutcome:
+        # A normal return-to-prediction recovery supersedes any stale-predictor
+        # reacquisition attempt.  The two mechanisms never share a buffer.
+        self._reacquisition_observations = []
         if self.state is I2State.QUARANTINED:
             self.state = I2State.RECOVERY
             self._recovery_observations = [observation]
@@ -218,6 +230,7 @@ class EnhancedPointProcessor:
             self._next_episode_id += 1
         self.state = I2State.QUARANTINED
         self._recovery_observations = []
+        self._reacquisition_observations = []
         if prediction is None:
             return self._record(
                 observation,
@@ -260,6 +273,85 @@ class EnhancedPointProcessor:
             "complete_safe_correction",
         )
 
+    def _try_stale_reacquisition(
+        self,
+        observation: TimedObservation,
+        raw: XYZ,
+        prediction: XYZ,
+    ) -> EnhancedStateOutcome:
+        """Rebuild trusted state from two clean observations after predictor drift.
+
+        This is deliberately separate from normal recovery: both observations
+        must be safe and mutually consistent within the unchanged 10 mm gate,
+        while the caller has already established that the old prediction is
+        stale.  No corrected candidate is ever eligible for this buffer.
+        """
+
+        if not self._reacquisition_observations:
+            # Keep the externally visible state quarantined until the second
+            # independent clean observation is confirmed.  This preserves the
+            # original one-frame recovery semantics.
+            self.state = I2State.QUARANTINED
+            self._recovery_observations = []
+            self._reacquisition_observations = [observation]
+            return self._record(
+                observation,
+                raw,
+                prediction,
+                None,
+                False,
+                False,
+                CandidateSafety.unavailable("reacquisition_confirmation_pending"),
+                "reacquisition_first_clean_observation",
+            )
+
+        first = self._reacquisition_observations[0]
+        time_ordered = observation.timestamp_s > first.timestamp_s
+        mutually_consistent = time_ordered and self._distance(first.xyz_mm, raw) <= self.recovery_consistency_mm
+        if not mutually_consistent:
+            self.state = I2State.QUARANTINED
+            self._recovery_observations = []
+            self._reacquisition_observations = []
+            return self._record(
+                observation,
+                raw,
+                prediction,
+                None,
+                False,
+                False,
+                CandidateSafety.unavailable("reacquisition_pair_inconsistent"),
+                "reacquisition_pair_inconsistent",
+            )
+
+        # Replacement, rather than append, ensures subsequent prediction uses
+        # only the newly acquired clean baseline and not the stale trajectory.
+        self.trusted_history = [first, observation]
+        self._recovery_observations = []
+        self._reacquisition_observations = []
+        self.state = I2State.NORMAL
+        self._episode_id = None
+        return self._record(
+            observation,
+            raw,
+            prediction,
+            None,
+            False,
+            True,
+            CandidateSafety.unavailable("no correction proposed"),
+            "reacquisition_confirmed",
+        )
+
+    @staticmethod
+    def _reacquisition_observation_is_safe(observation: TimedObservation) -> bool:
+        evidence = observation.evidence
+        return bool(
+            not evidence.hard_failure
+            and not evidence.confirmed_anomaly
+            and evidence.geometry_valid
+            and evidence.evidence_sufficient
+            and evidence.post_correction_safe
+        )
+
     def _quarantine(
         self,
         observation: TimedObservation,
@@ -273,6 +365,7 @@ class EnhancedPointProcessor:
             self._next_episode_id += 1
         self.state = I2State.QUARANTINED
         self._recovery_observations = []
+        self._reacquisition_observations = []
         return self._record(observation, raw, prediction, None, False, False, safety, reason)
 
     def _record(

@@ -4,7 +4,7 @@ import argparse
 from dataclasses import replace
 
 from .models import METHOD_NAMES, MatcherConfig
-from .runner import run_ablation_suite, run_manifest
+from .runner import run_ablation_suite, run_compensation_suite, run_confidence_suite, run_manifest
 
 
 def main() -> None:
@@ -14,7 +14,7 @@ def main() -> None:
         "--methods",
         nargs="+",
         choices=METHOD_NAMES,
-        default=["sgbm", "local", "local_flow", "full"],
+        default=["M0", "M1", "M2", "M3"],
     )
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--warmup-frames", type=int, default=30)
@@ -49,6 +49,9 @@ def main() -> None:
         action="store_true",
         help="Run the complete quality method and all one-component deletion variants",
     )
+    parser.add_argument("--confidence-suite", action="store_true", help="Run M3_C0 through M3_C3")
+    parser.add_argument("--compensation-suite", action="store_true", help="Run THESIS_FULL_R0 through R2")
+    parser.add_argument("--camera-compensation-mode", choices=("none", "single_reference", "multi_reference_rigid"))
     args = parser.parse_args()
     config = MatcherConfig()
     config = replace(
@@ -67,6 +70,7 @@ def main() -> None:
         enable_icgn=not args.disable_icgn,
         enable_adaptive_filter=not args.disable_adaptive_filter,
         enable_camera_compensation=not args.disable_camera_compensation,
+        **({"camera_compensation_mode": args.camera_compensation_mode} if args.camera_compensation_mode else {}),
     )
     optional_updates = {
         "cycle_soft_threshold_px": args.cycle_soft_threshold,
@@ -86,7 +90,11 @@ def main() -> None:
         config,
         **{key: value for key, value in optional_updates.items() if value is not None},
     )
-    if args.ablation_suite:
+    if args.compensation_suite:
+        outputs = run_compensation_suite(args.manifest, config=config, repeats=args.repeats, warmup_frames=args.warmup_frames)
+    elif args.confidence_suite:
+        outputs = run_confidence_suite(args.manifest, config=config, repeats=args.repeats, warmup_frames=args.warmup_frames)
+    elif args.ablation_suite:
         outputs = run_ablation_suite(
             args.manifest,
             config=config,

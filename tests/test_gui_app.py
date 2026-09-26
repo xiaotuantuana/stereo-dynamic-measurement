@@ -215,6 +215,28 @@ def test_window_requires_a_point_before_processing(qtbot, tmp_path: Path) -> Non
     window.add_point((32.0, 24.0), role="measurement")
 
     assert window.run_button.isEnabled() is True
+
+
+def test_window_builds_thesis_confidence_suite_requests(qtbot, tmp_path: Path) -> None:
+    project = Path(__file__).resolve().parents[1]
+    window = StereoMainWindow()
+    qtbot.addWidget(window)
+    window.load_video(project / "car.avi")
+    window.add_point((140.0, 320.0), role="measurement")
+    window.experiment_combo.setCurrentIndex(
+        window.experiment_combo.findData("confidence")
+    )
+
+    requests = window._thesis_requests()
+
+    assert [request.result_method_label for request in requests] == [
+        "M3_C0", "M3_C1", "M3_C2", "M3_C3",
+    ]
+    assert [request.config.confidence_mode for request in requests] == [
+        "none", "single_margin", "multi_reject", "closed_loop",
+    ]
+    assert all(not request.config.enable_camera_compensation for request in requests)
+    assert all(request.output_path.parent.name == "thesis_experiments" for request in requests)
     assert window.point_table.rowCount() == 1
 
 

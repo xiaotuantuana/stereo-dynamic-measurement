@@ -7,8 +7,18 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Runtime and experiment outputs
-outputs/
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime-only outputs. Curated research artefacts under outputs/ remain visible
+# to Git so they can be deliberately versioned when needed.
+outputs/tmp/
+outputs/debug/
+outputs/**/tmp/
+outputs/**/debug/
 stereo_app_outputs/
 stereo_point_cloud_outputs/
 experiments/**/results/
@@ -31,3 +41,6 @@ experiments/gui_validation/
 *.obj
 *.lib
 *.zip
+
+# Runtime logs
+*.log

@@ -84,41 +84,50 @@ def _classification_metrics(expected: pd.Series, predicted: pd.Series, labels: l
     return np.asarray(precision), np.asarray(recall), np.asarray(f1), accuracy
 
 
-def run_fault_benchmark(*, output_dir: str | Path, seeds: int = 20) -> dict[str, float | int]:
+def run_fault_benchmark(
+    *,
+    output_dir: str | Path,
+    seeds: int = 20,
+    severities: tuple[str, ...] = ("medium",),
+) -> dict[str, float | int]:
     if seeds < 1:
         raise ValueError("seeds must be positive")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, object]] = []
     for seed in range(seeds):
-        for case in _CASES:
-            reference = _source()
-            observed = reference if case == "clean" else FaultInjector(seed).inject(reference, case)
-            measurement, before_confidence, reference_features = _measurement_from_observation(observed, reference)
-            # Labels are used only below for metrics, never passed to diagnosis or recovery.
-            def validate(candidate: MeasurementResult, before=before_confidence) -> PhysicsValidationResult:
-                return _physics(candidate, 0.9 if candidate.measurement_confidence >= 0.8 else before)
-
-            def remeasure(action: RecoveryAction) -> MeasurementResult:
-                return MeasurementResult(
-                    frame_id=0, timestamp=0.0, point_id="P1", left_xy=(10.0, 10.0), right_xy=(5.0, 10.0),
-                    disparity_raw=5.0, disparity_subpixel=5.0, xyz_raw=np.array([0.0, 0.0, 2_000.0]),
-                    gradient_score=0.9, texture_score=0.9, blur_score=0.9, measurement_confidence=0.9,
+        for severity in severities:
+            for case in _CASES:
+                reference = _source()
+                observed = (
+                    reference if case == "clean"
+                    else FaultInjector(seed).inject(reference, case, severity=severity)
                 )
+                measurement, before_confidence, reference_features = _measurement_from_observation(observed, reference)
+                # Labels are used only below for metrics, never passed to diagnosis or recovery.
+                def validate(candidate: MeasurementResult, before=before_confidence) -> PhysicsValidationResult:
+                    return _physics(candidate, 0.9 if candidate.measurement_confidence >= 0.8 else before)
 
-            orchestrated = StereoMeasurementOrchestrator().process(
-                measurement=measurement, validate=validate, remeasure=remeasure, **reference_features
-            )
-            before_rmse = max(measurement.lr_residual, measurement.epipolar_residual, measurement.flow_fb_error, measurement.tracking_loss_residual)
-            after_rmse = max(orchestrated.measurement_after.lr_residual, orchestrated.measurement_after.epipolar_residual, orchestrated.measurement_after.flow_fb_error)
-            records.append({
-                "seed": seed, "case": case, "expected_fault": _EXPECTED[case],
-                "predicted_fault": orchestrated.diagnosis.fault_type, "fault_score": orchestrated.diagnosis.fault_score,
-                "recovery_action": orchestrated.diagnosis.recovery_action.action_type,
-                "recovery_success": orchestrated.diagnosis.recovery_success, "rmse_before": before_rmse,
-                "rmse_after": after_rmse, "c_phy_before": orchestrated.diagnosis.c_phy_before,
-                "c_phy_after": orchestrated.diagnosis.c_phy_after,
-            })
+                def remeasure(action: RecoveryAction) -> MeasurementResult:
+                    return MeasurementResult(
+                        frame_id=0, timestamp=0.0, point_id="P1", left_xy=(10.0, 10.0), right_xy=(5.0, 10.0),
+                        disparity_raw=5.0, disparity_subpixel=5.0, xyz_raw=np.array([0.0, 0.0, 2_000.0]),
+                        gradient_score=0.9, texture_score=0.9, blur_score=0.9, measurement_confidence=0.9,
+                    )
+
+                orchestrated = StereoMeasurementOrchestrator().process(
+                    measurement=measurement, validate=validate, remeasure=remeasure, **reference_features
+                )
+                before_rmse = max(measurement.lr_residual, measurement.epipolar_residual, measurement.flow_fb_error, measurement.tracking_loss_residual)
+                after_rmse = max(orchestrated.measurement_after.lr_residual, orchestrated.measurement_after.epipolar_residual, orchestrated.measurement_after.flow_fb_error)
+                records.append({
+                    "seed": seed, "severity": severity, "case": case, "expected_fault": _EXPECTED[case],
+                    "predicted_fault": orchestrated.diagnosis.fault_type, "fault_score": orchestrated.diagnosis.fault_score,
+                    "recovery_action": orchestrated.diagnosis.recovery_action.action_type,
+                    "recovery_success": orchestrated.diagnosis.recovery_success, "rmse_before": before_rmse,
+                    "rmse_after": after_rmse, "c_phy_before": orchestrated.diagnosis.c_phy_before,
+                    "c_phy_after": orchestrated.diagnosis.c_phy_after,
+                })
     cases = pd.DataFrame(records)
     labels = sorted(set(_EXPECTED.values()))
     precision, recall, f1, accuracy = _classification_metrics(cases.expected_fault, cases.predicted_fault, labels)
@@ -133,11 +142,45 @@ def run_fault_benchmark(*, output_dir: str | Path, seeds: int = 20) -> dict[str,
         "rmse_before": float(cases[cases.case != "clean"].rmse_before.mean()),
         "rmse_after": float(cases[cases.case != "clean"].rmse_after.mean()),
     }])
+    expected_abnormal = cases.expected_fault != "NORMAL"
+    predicted_abnormal = cases.predicted_fault != "NORMAL"
+    tp = int((expected_abnormal & predicted_abnormal).sum())
+    fp = int((~expected_abnormal & predicted_abnormal).sum())
+    fn = int((expected_abnormal & ~predicted_abnormal).sum())
+    precision_binary = tp / (tp + fp) if tp + fp else 0.0
+    recall_binary = tp / (tp + fn) if tp + fn else 0.0
+    f1_binary = 0.0 if precision_binary + recall_binary == 0 else 2 * precision_binary * recall_binary / (precision_binary + recall_binary)
+    catastrophic = cases.rmse_before > 3.0
+    intercepted = catastrophic & (cases.rmse_after <= 3.0)
+    severity_metrics = pd.DataFrame([
+        {
+            "severity": severity,
+            "accuracy": float((group.expected_fault == group.predicted_fault).mean()),
+            "false_positive_rate": float(((group.expected_fault == "NORMAL") & (group.predicted_fault != "NORMAL")).sum() / max((group.expected_fault == "NORMAL").sum(), 1)),
+            "false_negative_rate": float(((group.expected_fault != "NORMAL") & (group.predicted_fault == "NORMAL")).sum() / max((group.expected_fault != "NORMAL").sum(), 1)),
+        }
+        for severity, group in cases.groupby("severity", sort=True)
+    ])
     cases.to_csv(output / "per_case_results.csv", index=False, encoding="utf-8-sig")
     metrics.to_csv(output / "metrics.csv", index=False, encoding="utf-8-sig")
     confusion.to_csv(output / "confusion_matrix.csv", encoding="utf-8-sig")
     recovery.to_csv(output / "recovery_metrics.csv", index=False, encoding="utf-8-sig")
-    summary = {"case_count": int(len(cases)), **{key: float(value) for key, value in recovery.iloc[0].to_dict().items()}}
+    severity_metrics.to_csv(output / "severity_metrics.csv", index=False, encoding="utf-8-sig")
+    cases[cases.expected_fault != cases.predicted_fault].to_csv(output / "false_diagnosis_cases.csv", index=False, encoding="utf-8-sig")
+    cases[cases.expected_fault == cases.predicted_fault].head(20).to_csv(output / "diagnosis_success_cases.csv", index=False, encoding="utf-8-sig")
+    cases[(cases.expected_fault == "NORMAL") & (cases.predicted_fault != "NORMAL")].head(20).to_csv(output / "false_positive_cases.csv", index=False, encoding="utf-8-sig")
+    cases[(cases.expected_fault != "NORMAL") & (cases.predicted_fault == "NORMAL")].head(20).to_csv(output / "false_negative_cases.csv", index=False, encoding="utf-8-sig")
+    summary = {
+        "case_count": int(len(cases)),
+        "fault_class_count": len(labels) - 1,
+        **{key: float(value) for key, value in recovery.iloc[0].to_dict().items()},
+        "precision": float(precision_binary), "recall": float(recall_binary), "f1": float(f1_binary),
+        "false_negative_rate": float(fn / max(int(expected_abnormal.sum()), 1)),
+        "catastrophic_interception_rate": float(intercepted.sum() / max(int(catastrophic.sum()), 1)),
+        "cer_before": float(catastrophic.mean()), "cer_after": float((cases.rmse_after > 3.0).mean()),
+        "valid_measurement_retention": float((clean.predicted_fault == "NORMAL").mean()),
+        "ground_truth_online_access": False,
+    }
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 

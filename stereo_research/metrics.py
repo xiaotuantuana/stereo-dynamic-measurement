@@ -25,7 +25,32 @@ def evaluate_rows(
         for row in gt_rows
         if _as_int(row.get("frame")) < 0
     }
+    # External physical GT is written onto each visual frame by the runner.
+    # Prefer it over sparse manual stereo annotations for 3-D metrics.
+    for row in rows:
+        if str(row.get("gt_valid", "")).lower() not in {"1", "true", "yes"}:
+            continue
+        frame = _as_int(row.get("frame"))
+        point_id = str(row.get("point_id"))
+        if frame < 0 or not point_id:
+            continue
+        external = {
+            "X_m": row.get("X_gt"), "Y_m": row.get("Y_gt"), "Z_m": row.get("Z_gt"),
+            "distance_m": None,
+        }
+        gt_by_key[(frame, point_id)] = external
     valid_rows = [row for row in rows if str(row.get("status")) == "valid"]
+    accepted_count = sum(_as_bool(row.get("measurement_accepted_for_state")) for row in rows)
+    rejected_count = sum(
+        str(row.get("status")) == "confidence_rejected"
+        or (not _as_bool(row.get("measurement_accepted_for_state")) and str(row.get("measurement_accepted_for_state", "")) != "")
+        for row in rows
+    )
+    predict_only_count = sum(str(row.get("state_update_source")) == "predicted" for row in rows)
+    confidence_counts = Counter(
+        str(row.get("confidence_state", "")).upper()
+        for row in rows if str(row.get("confidence_state", "")).upper() in {"HIGH", "MEDIUM", "LOW", "LOST"}
+    )
     quality_stages = Counter(
         str(row.get("quality_stage"))
         for row in valid_rows
@@ -39,6 +64,18 @@ def evaluate_rows(
         "coverage_pct": _percent(len(valid_rows), len(rows)),
         "effective_tracking_rate_pct": _percent(len(valid_rows), len(rows)),
         "status_counts": dict(Counter(str(row.get("status", "")) for row in rows)),
+        "measurement_accept_rate_pct": _percent(accepted_count, len(rows)),
+        "measurement_reject_rate_pct": _percent(rejected_count, len(rows)),
+        "predict_only_rate_pct": _percent(predict_only_count, len(rows)),
+        "rejected_measurement_count": rejected_count,
+        "confidence_high_count": confidence_counts["HIGH"],
+        "confidence_medium_count": confidence_counts["MEDIUM"],
+        "confidence_low_count": confidence_counts["LOW"],
+        "confidence_lost_count": confidence_counts["LOST"],
+        "confidence_high_pct": _percent(confidence_counts["HIGH"], len(rows)),
+        "confidence_medium_pct": _percent(confidence_counts["MEDIUM"], len(rows)),
+        "confidence_low_pct": _percent(confidence_counts["LOW"], len(rows)),
+        "confidence_lost_pct": _percent(confidence_counts["LOST"], len(rows)),
         "quality_stage_counts": dict(quality_stages),
         "quality_context_recovery_count": sum(
             count for stage, count in quality_stages.items() if "context" in stage

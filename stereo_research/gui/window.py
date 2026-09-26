@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,7 +41,7 @@ from ..calibration import StereoCalibration
 from ..models import MatcherConfig, MethodName, PointSpec
 from ..runner import load_calibration, split_side_by_side
 from .settings import ParameterSpec, build_matcher_config, parameter_groups
-from .processing import FramePreview, ProcessingRequest, ProcessingSummary, ProcessingWorker
+from .processing import BatchProcessingSummary, BatchProcessingWorker, FramePreview, ProcessingRequest, ProcessingSummary, ProcessingWorker
 from .theme import APP_STYLE
 from .video import VideoMetadata, inspect_stereo_video
 from .widgets import AspectImageView
@@ -49,6 +49,11 @@ from .widgets import AspectImageView
 
 METHOD_OPTIONS: tuple[tuple[str, MethodName], ...] = (
     ("完整研究方法 · 时空预测 + 闭环 + IC-GN + 滤波", "research_full"),
+    ("论文最终方法 · 创新1 + 闭环 + 多参考刚体补偿", "THESIS_FULL"),
+    ("M3 · 创新点1自适应局部匹配", "M3"),
+    ("M2 · 光流 + 历史预测", "M2"),
+    ("M1 · 光流 + 固定局部窗口", "M1"),
+    ("M0 · 全局 SGBM", "M0"),
     ("质量优先局部方法 · 多尺度恢复", "full_quality"),
     ("完整局部方法 · 预测 + 约束 + 亚像素", "full"),
     ("局部搜索 + 左图光流", "local_flow"),
@@ -207,6 +212,18 @@ class StereoMainWindow(QMainWindow):
         self.pause_button.toggled.connect(self._toggle_pause)
         self.stop_button.clicked.connect(self.stop_processing)
         layout.addWidget(self.run_button)
+        layout.addWidget(self._section_label("03  论文正式实验"))
+        self.experiment_combo = QComboBox()
+        self.experiment_combo.addItem("创新点1：M0 / M1 / M2 / M3", "innovation1")
+        self.experiment_combo.addItem("创新点2：M3_C0 / C1 / C2 / C3", "confidence")
+        self.experiment_combo.addItem("创新点3：THESIS_FULL_R0 / R1 / R2", "compensation")
+        self.experiment_combo.addItem("最终方法：THESIS_FULL_R2", "final")
+        self.experiment_combo.setAccessibleName("选择论文正式实验")
+        layout.addWidget(self.experiment_combo)
+        self.experiment_button = QPushButton("运行所选正式实验")
+        self.experiment_button.setEnabled(False)
+        self.experiment_button.clicked.connect(self.start_thesis_experiment)
+        layout.addWidget(self.experiment_button)
         layout.addLayout(controls)
         return sidebar
 
@@ -447,6 +464,50 @@ class StereoMainWindow(QMainWindow):
             config=self.current_config(),
         )
 
+    def _thesis_requests(self) -> tuple[ProcessingRequest, ...]:
+        if self.video_path is None or not self.points:
+            raise ValueError("请先选择视频并添加测点")
+        group = str(self.experiment_combo.currentData())
+        base = self.current_config()
+        root = self.video_path.parent / "stereo_outputs" / "thesis_experiments"
+        if group == "innovation1":
+            variants = ((name, name, base) for name in ("M0", "M1", "M2", "M3"))
+        elif group == "confidence":
+            variants = (
+                ("M3_C0", "THESIS_FULL", replace(base, confidence_mode="none", enable_camera_compensation=False)),
+                ("M3_C1", "THESIS_FULL", replace(base, confidence_mode="single_margin", enable_camera_compensation=False)),
+                ("M3_C2", "THESIS_FULL", replace(base, confidence_mode="multi_reject", enable_camera_compensation=False)),
+                ("M3_C3", "THESIS_FULL", replace(base, confidence_mode="closed_loop", enable_camera_compensation=False)),
+            )
+        elif group == "compensation":
+            variants = tuple(
+                (label, "THESIS_FULL", replace(base, confidence_mode="closed_loop", camera_compensation_mode=mode, enable_camera_compensation=mode != "none"))
+                for label, mode in (("THESIS_FULL_R0", "none"), ("THESIS_FULL_R1", "single_reference"), ("THESIS_FULL_R2", "multi_reference_rigid"))
+            )
+        else:
+            variants = (("THESIS_FULL_R2", "THESIS_FULL", replace(base, confidence_mode="closed_loop", camera_compensation_mode="multi_reference_rigid", enable_camera_compensation=True)),)
+        return tuple(
+            ProcessingRequest(
+                video_path=self.video_path,
+                output_path=root / f"{label}.csv",
+                method=method,
+                start_frame=self.start_frame_spin.value(),
+                end_frame=self.end_frame_spin.value(),
+                points=tuple(self.points), calibration=self.calibration,
+                config=config, result_method_label=label,
+            )
+            for label, method, config in variants
+        )
+
+    def start_thesis_experiment(self) -> None:
+        try:
+            requests = self._thesis_requests()
+        except ValueError as exc:
+            self._show_error("无法启动正式实验", str(exc))
+            return
+        self.last_output_path = requests[0].output_path
+        self._start_worker(BatchProcessingWorker(requests), f"正式实验将保存到 {requests[0].output_path.parent}")
+
     def start_processing(self, output_path: str | Path | None = None) -> None:
         if not self.video_path or not self.points:
             return
@@ -464,15 +525,17 @@ class StereoMainWindow(QMainWindow):
             self._show_error("参数无效", str(exc))
             return
         self.last_output_path = request.output_path
+        self.metric_values["method"].setText(str(request.method))
+        self._start_worker(ProcessingWorker(request), f"结果将保存到 {request.output_path}")
+
+    def _start_worker(self, worker: ProcessingWorker | BatchProcessingWorker, detail: str) -> None:
         self._processing = True
         self._set_processing_controls(True)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("准备处理…")
-        self._set_status("处理中", f"结果将保存到 {request.output_path}")
-        self.metric_values["method"].setText(str(request.method))
+        self._set_status("处理中", detail)
 
         thread = QThread(self)
-        worker = ProcessingWorker(request)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.frameReady.connect(self._on_processing_frame)
@@ -531,9 +594,15 @@ class StereoMainWindow(QMainWindow):
         self.progress_bar.setValue(preview.progress_pct)
         self.progress_bar.setFormat(f"第 {preview.frame} 帧  ·  {preview.progress_pct}%")
 
-    def _on_processing_complete(self, summary: ProcessingSummary) -> None:
+    def _on_processing_complete(self, summary: ProcessingSummary | BatchProcessingSummary) -> None:
         self._processing = False
         self._set_processing_controls(False)
+        if isinstance(summary, BatchProcessingSummary):
+            paths = "\n".join(str(item.output_path) for item in summary.summaries)
+            self.progress_bar.setValue(100 if not summary.cancelled else self.progress_bar.value())
+            self.progress_bar.setFormat("正式实验完成" if not summary.cancelled else "正式实验已停止")
+            self._set_status("正式实验完成" if not summary.cancelled else "正式实验已停止", f"已输出 {len(summary.summaries)} 组 CSV：\n{paths}")
+            return
         if summary.cancelled:
             self._set_status(
                 "已停止",
@@ -568,6 +637,8 @@ class StereoMainWindow(QMainWindow):
         self.end_frame_spin.setEnabled(not processing)
         self.frame_slider.setEnabled(not processing)
         self.advanced_toggle.setEnabled(not processing)
+        self.experiment_combo.setEnabled(not processing)
+        self.experiment_button.setEnabled(False if processing else bool(self.video_path and self.points))
         self.run_button.setEnabled(False if processing else bool(self.video_path and self.points))
         self.pause_button.setEnabled(processing)
         self.stop_button.setEnabled(processing)
@@ -640,6 +711,7 @@ class StereoMainWindow(QMainWindow):
     def _update_run_enabled(self) -> None:
         ready = self.video_path is not None and bool(self.points) and not self._processing
         self.run_button.setEnabled(ready)
+        self.experiment_button.setEnabled(ready)
 
     def _toggle_advanced(self, checked: bool) -> None:
         self.advanced_container.setVisible(checked)

@@ -32,6 +32,7 @@ class LocalMatchResult:
     lr_error_px: float | None = None
     used_search_radius: int = 0
     neighbor_disparity: float | None = None
+    neighbor_disparity_mad: float | None = None
     raw_disparity: float | None = None
     integer_disparity: float | None = None
     measured_disparity: float | None = None
@@ -62,6 +63,22 @@ class LocalMatchResult:
     subpixel_final_status: str = "not_attempted"
     zncc_cost_curvature: float | None = None
     curvature_sample_step_px: float | None = None
+
+
+@dataclass(frozen=True)
+class InitialMatchDiagnostics:
+    status: str
+    predicted_disparity: float
+    predicted_cost: float | None = None
+    best_disparity: float | None = None
+    best_cost: float | None = None
+    second_best_disparity: float | None = None
+    second_best_cost: float | None = None
+    uniqueness_margin: float | None = None
+    texture_std: float | None = None
+    candidate_count: int = 0
+    predicted_best_disagreement: float | None = None
+    confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -114,6 +131,86 @@ class LocalMatcher:
     def __init__(self, config: MatcherConfig):
         self.config = config
 
+    def diagnose_initial(
+        self,
+        left_gray: np.ndarray,
+        right_gray: np.ndarray,
+        left_xy: tuple[float, float],
+        predicted_disparity: float,
+        *,
+        max_disparity: int,
+        lr_error_px: float | None,
+    ) -> InitialMatchDiagnostics:
+        """Score an initialization using runtime evidence without changing its disparity."""
+
+        self._validate_images(left_gray, right_gray)
+        left_patch = self._extract_patch(left_gray, left_xy)
+        if left_patch is None:
+            return InitialMatchDiagnostics("out_of_bounds", predicted_disparity)
+        texture_std = float(np.std(left_patch))
+        if texture_std < self.config.min_texture_std:
+            return InitialMatchDiagnostics(
+                "low_texture", predicted_disparity, texture_std=texture_std
+            )
+        candidates: list[tuple[float, float]] = []
+        maximum = min(
+            int(max_disparity),
+            int(left_xy[0] - self.config.patch_size // 2 - 1),
+        )
+        for disparity in range(1, maximum + 1):
+            right_patch = self._extract_patch(
+                right_gray, (left_xy[0] - disparity, left_xy[1])
+            )
+            if right_patch is not None:
+                candidates.append((float(disparity), self._photo_cost(left_patch, right_patch)))
+        if not candidates:
+            return InitialMatchDiagnostics(
+                "out_of_bounds", predicted_disparity, texture_std=texture_std
+            )
+        ordered = sorted(candidates, key=lambda item: item[1])
+        best_disparity, best_cost = ordered[0]
+        second = next(
+            (item for item in ordered[1:] if abs(item[0] - best_disparity) > 1.0),
+            None,
+        )
+        predicted_disparity_value, predicted_cost = min(
+            candidates, key=lambda item: abs(item[0] - predicted_disparity)
+        )
+        second_disparity = None if second is None else second[0]
+        second_cost = None if second is None else second[1]
+        margin = None if second_cost is None else max(0.0, second_cost - best_cost)
+        texture_score = float(np.clip(
+            texture_std / self.config.uncertainty_texture_reference, 0.0, 1.0
+        ))
+        photo_score = float(np.clip(
+            1.0 - predicted_cost / self.config.max_photo_cost, 0.0, 1.0
+        ))
+        margin_score = 0.0 if margin is None else float(np.clip(
+            margin / self.config.uniqueness_margin, 0.0, 1.0
+        ))
+        lr_score = 0.0 if lr_error_px is None else float(np.clip(
+            1.0 - lr_error_px / self.config.lr_threshold, 0.0, 1.0
+        ))
+        disagreement = abs(predicted_disparity - best_disparity)
+        agreement_score = float(np.exp(-disagreement / 2.0))
+        confidence = float(min(
+            texture_score, photo_score, margin_score, lr_score, agreement_score
+        ))
+        return InitialMatchDiagnostics(
+            status="valid",
+            predicted_disparity=predicted_disparity_value,
+            predicted_cost=float(predicted_cost),
+            best_disparity=best_disparity,
+            best_cost=float(best_cost),
+            second_best_disparity=second_disparity,
+            second_best_cost=None if second_cost is None else float(second_cost),
+            uniqueness_margin=margin,
+            texture_std=texture_std,
+            candidate_count=len(candidates),
+            predicted_best_disagreement=disagreement,
+            confidence=confidence,
+        )
+
     def match(
         self,
         left_gray: np.ndarray,
@@ -124,7 +221,11 @@ class LocalMatcher:
         latest_disparity: float | None = None,
         temporal_right_xy: tuple[float, float] | None = None,
         right_flow_fb_error_px: float | None = None,
+        search_radius: int | None = None,
+        refinement_level: int = 0,
     ) -> LocalMatchResult:
+        if refinement_level < 0:
+            raise ValueError("refinement_level must be non-negative")
         self._validate_images(left_gray, right_gray)
         left_patch = self._extract_patch(left_gray, left_xy)
         if left_patch is None:
@@ -143,18 +244,26 @@ class LocalMatcher:
             and right_flow_fb_error_px is not None
             and right_flow_fb_error_px <= self.config.right_flow_fb_threshold
         )
-        neighbor_disparity = (
+        neighbor_disparity, neighbor_disparity_mad = (
             self._neighborhood_disparity(left_gray, right_gray, left_xy, predicted_disparity)
             if use_neighborhood
-            else None
+            else (None, None)
         )
 
+        primary_radius = self.config.search_radius if search_radius is None else search_radius
+        # Fixed M1/M2 calls retain the configured radius. M3/research_full passes
+        # its per-frame radius from the confidence-feedback controller.
+        fallback_radius = (
+            self.config.expanded_search_radius
+            if search_radius is None
+            else primary_radius
+        )
         first = self._search(
             left_patch,
             right_gray,
             left_xy,
             predicted_disparity,
-            self.config.search_radius,
+            primary_radius,
             use_prediction,
             use_epipolar,
             neighbor_disparity,
@@ -166,19 +275,19 @@ class LocalMatcher:
                 right_gray,
                 left_xy,
                 predicted_disparity,
-                self.config.expanded_search_radius,
+                fallback_radius,
                 use_prediction,
                 use_epipolar,
                 neighbor_disparity,
                 temporal_right_xy if use_cycle else None,
             )
-        elif self._best_on_horizontal_boundary(first, predicted_disparity, self.config.search_radius):
+        elif self._best_on_horizontal_boundary(first, predicted_disparity, primary_radius):
             expanded = self._search(
                 left_patch,
                 right_gray,
                 left_xy,
                 predicted_disparity,
-                self.config.expanded_search_radius,
+                fallback_radius,
                 use_prediction,
                 use_epipolar,
                 neighbor_disparity,
@@ -243,8 +352,8 @@ class LocalMatcher:
                     float(best.disparity),
                     float(best.vertical_offset),
                     self.config.icgn_patch_size,
-                    self.config.icgn_max_iterations,
-                    self.config.icgn_epsilon,
+                    self.config.icgn_max_iterations * (1 + refinement_level),
+                    self.config.icgn_epsilon / (1 + refinement_level),
                     self.config.icgn_max_offset_px,
                     self.config.icgn_max_residual,
                 )
@@ -400,6 +509,7 @@ class LocalMatcher:
             lr_error_px=lr_error,
             used_search_radius=self._search_radius(first, predicted_disparity),
             neighbor_disparity=neighbor_disparity,
+            neighbor_disparity_mad=neighbor_disparity_mad,
             raw_disparity=disparity,
             integer_disparity=float(best.disparity),
             measured_disparity=disparity,
@@ -511,7 +621,7 @@ class LocalMatcher:
         right_gray: np.ndarray,
         left_xy: tuple[float, float],
         predicted_disparity: float,
-    ) -> float | None:
+    ) -> tuple[float | None, float | None]:
         x, y = left_xy
         center_intensity = self._sample_intensity(left_gray, left_xy)
         support_points = [
@@ -541,8 +651,10 @@ class LocalMatcher:
             disparities.append(float(best))
             weights.append(float(np.exp(-intensity_delta / max(self.config.support_intensity_threshold, 1e-6))))
         if len(disparities) < 3:
-            return None
-        return weighted_median(np.asarray(disparities), np.asarray(weights))
+            return None, None
+        values = np.asarray(disparities, dtype=np.float64)
+        median = float(np.median(values))
+        return weighted_median(values, np.asarray(weights)), float(np.median(np.abs(values - median)))
 
     def _best_photo_disparity(
         self,
@@ -829,6 +941,8 @@ class QualityLocalMatcher:
         latest_disparity: float | None = None,
         temporal_right_xy: tuple[float, float] | None = None,
         right_flow_fb_error_px: float | None = None,
+        search_radius: int | None = None,
+        refinement_level: int = 0,
     ) -> LocalMatchResult:
         primary = self.primary.match(
             left_gray,
@@ -839,6 +953,8 @@ class QualityLocalMatcher:
             latest_disparity=latest_disparity,
             temporal_right_xy=temporal_right_xy,
             right_flow_fb_error_px=right_flow_fb_error_px,
+            search_radius=search_radius,
+            refinement_level=refinement_level,
         )
         if primary.status == "valid":
             result = replace(
@@ -859,6 +975,8 @@ class QualityLocalMatcher:
                 latest_disparity=latest_disparity,
                 temporal_right_xy=temporal_right_xy,
                 right_flow_fb_error_px=right_flow_fb_error_px,
+                search_radius=search_radius,
+                refinement_level=refinement_level,
             )
             if context.status == "valid":
                 result = replace(context, quality_stage="context_recovery")
@@ -880,6 +998,8 @@ class QualityLocalMatcher:
                     latest_disparity=latest_disparity,
                     temporal_right_xy=temporal_right_xy,
                     right_flow_fb_error_px=right_flow_fb_error_px,
+                    search_radius=search_radius,
+                    refinement_level=refinement_level,
                 )
                 if recovered.status != "valid":
                     return primary

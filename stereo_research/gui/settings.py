@@ -118,6 +118,7 @@ def parameter_groups() -> tuple[ParameterGroup, ...]:
                 _float("min_depth_m", "最小深度 / m", 0.01, 100.0, 0.1),
                 _float("max_depth_m", "最大深度 / m", 0.1, 1000.0, 1.0),
                 _bool("enable_camera_compensation", "启用相机运动补偿"),
+                ParameterSpec("camera_compensation_mode", "相机补偿模式", "choice", choices=("none", "single_reference", "multi_reference_rigid")),
                 _int("camera_compensation_min_points", "最少参考点", 3, 30),
                 _float("camera_compensation_inlier_threshold_mm", "补偿内点阈值 / mm", 0.1, 100.0, 0.1),
                 _float("camera_compensation_max_rmse_mm", "补偿最大 RMSE / mm", 0.1, 100.0, 0.1),

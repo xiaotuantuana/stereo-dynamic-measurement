@@ -1,0 +1,2 @@
+frame,timestamp_s,point_id,gt_x_mm,gt_y_mm,gt_z_mm,gt_sigma_x_mm,gt_sigma_y_mm,gt_sigma_z_mm,data_source
+,,,,,,,,,REAL_E0

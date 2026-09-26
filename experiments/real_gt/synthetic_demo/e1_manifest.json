@@ -1,0 +1,23 @@
+{
+  "experiment_id": "synthetic-demo",
+  "gt_unit": "mm",
+  "data_source": "SYNTHETIC_DRY_RUN",
+  "experiment_type": "E1",
+  "conditions": [
+    {
+      "sequence_id": "SYN_E1_001",
+      "split": "evaluation",
+      "distance_m": 2.0,
+      "baseline_mm": 120.0,
+      "target_sigma_z_mm": 5.0,
+      "method": "M3",
+      "repeat": 1,
+      "calibration_id": "synthetic_demo_120mm",
+      "calibration": "calibration.json",
+      "measurement": "measurement.csv",
+      "gt": "gt.csv",
+      "alignment_mode": "timestamp",
+      "max_time_offset_ms": 20
+    }
+  ]
+}

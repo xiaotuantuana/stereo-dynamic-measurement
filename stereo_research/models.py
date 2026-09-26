@@ -997,6 +997,9 @@ class FramePointResult:
     i2_prediction_x_m: float | None = None
     i2_prediction_y_m: float | None = None
     i2_prediction_z_m: float | None = None
+    i2_trusted_committed: bool | None = None
+    i2_correction_applied: bool | None = None
+    i2_reason: str = ""
     candidate_safe: bool | None = None
     candidate_safety_reasons: str = ""
 

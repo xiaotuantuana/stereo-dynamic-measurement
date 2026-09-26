@@ -28,17 +28,18 @@ def estimate_match_uncertainty(
     icgn_hessian: float | None,
     config: MatcherConfig,
     icgn_hessian_density: float | None = None,
+    neighbor_disparity_mad: float | None = None,
 ) -> MatchUncertainty:
     maximum = config.uncertainty_max_component
     epsilon = 1e-9
 
-    def ratio(value: float | None, denominator: float) -> float:
+    def ratio(value: float | None, denominator: float) -> float | None:
         if value is None or not np.isfinite(value):
-            return 0.0
+            return None
         return float(np.clip(abs(value) / max(denominator, epsilon), 0.0, maximum))
 
     texture_risk = (
-        0.0
+        None
         if texture_std is None or not np.isfinite(texture_std)
         else float(
             np.clip(
@@ -50,7 +51,7 @@ def estimate_match_uncertainty(
     )
     photo_risk = ratio(photo_cost, 1.0)
     margin_risk = (
-        0.0
+        None
         if uniqueness_margin is None or not np.isfinite(uniqueness_margin)
         else float(
             np.clip(
@@ -60,12 +61,11 @@ def estimate_match_uncertainty(
             )
         )
     )
-    flow_values = [
+    flow_values = [value for value in (
         ratio(flow_fb_error_px, config.flow_fb_threshold),
         ratio(right_flow_fb_error_px, config.right_flow_fb_threshold),
-    ]
-    present_flow_count = sum(value is not None for value in (flow_fb_error_px, right_flow_fb_error_px))
-    flow_risk = sum(flow_values) / max(present_flow_count, 1)
+    ) if value is not None]
+    flow_risk = sum(flow_values) / len(flow_values) if flow_values else None
     lr_risk = ratio(lr_error_px, config.lr_threshold)
     cycle_risk = ratio(cycle_error_px, config.cycle_hard_threshold_px)
     icgn_risk = ratio(icgn_residual, config.icgn_max_residual)
@@ -73,12 +73,12 @@ def estimate_match_uncertainty(
     if density is None and icgn_hessian is not None and np.isfinite(icgn_hessian):
         density = float(icgn_hessian) / float(config.icgn_patch_size ** 2)
     icgn_hessian_risk = (
-        0.0
+        None
         if density is None or not np.isfinite(density)
         else float(np.clip(1.0 / max(density, epsilon), 0.0, maximum))
     )
     curvature_risk = (
-        maximum
+        None
         if cost_curvature is None or not np.isfinite(cost_curvature)
         else float(
             np.clip(
@@ -89,6 +89,7 @@ def estimate_match_uncertainty(
         )
     )
 
+    neighbor_risk = ratio(neighbor_disparity_mad, config.uncertainty_neighbor_mad_reference)
     components = {
         "texture": texture_risk,
         "photo": photo_risk,
@@ -99,18 +100,17 @@ def estimate_match_uncertainty(
         "icgn": icgn_risk,
         "icgn_hessian": icgn_hessian_risk,
         "curvature": curvature_risk,
+        "neighbor": neighbor_risk,
     }
-    weighted_risk = (
-        config.uncertainty_weight_texture * texture_risk
-        + config.uncertainty_weight_photo * photo_risk
-        + config.uncertainty_weight_margin * margin_risk
-        + config.uncertainty_weight_flow * flow_risk
-        + config.uncertainty_weight_lr * lr_risk
-        + config.uncertainty_weight_cycle * cycle_risk
-        + config.uncertainty_weight_icgn * icgn_risk
-        + config.uncertainty_weight_icgn_hessian * icgn_hessian_risk
-        + config.uncertainty_weight_curvature * curvature_risk
-    )
+    weights = {
+        "texture": config.uncertainty_weight_texture, "photo": config.uncertainty_weight_photo,
+        "margin": config.uncertainty_weight_margin, "flow": config.uncertainty_weight_flow,
+        "lr": config.uncertainty_weight_lr, "cycle": config.uncertainty_weight_cycle,
+        "icgn": config.uncertainty_weight_icgn, "icgn_hessian": config.uncertainty_weight_icgn_hessian,
+        "curvature": config.uncertainty_weight_curvature, "neighbor": config.uncertainty_weight_neighbor,
+    }
+    available = [(weights[key], risk) for key, risk in components.items() if risk is not None and weights[key] > 0]
+    weighted_risk = sum(weight * risk for weight, risk in available) / sum(weight for weight, _ in available) if available else 0.0
     disparity_variance = float(
         np.clip(
             config.uncertainty_base_disparity_variance_px2 * (1.0 + weighted_risk),
@@ -119,9 +119,7 @@ def estimate_match_uncertainty(
         )
     )
     left_risk = (
-        config.uncertainty_weight_texture * texture_risk
-        + config.uncertainty_weight_flow * flow_risk
-        + 0.5 * config.uncertainty_weight_cycle * cycle_risk
+        sum(weight * risk for weight, risk in ((config.uncertainty_weight_texture, texture_risk), (config.uncertainty_weight_flow, flow_risk), (0.5 * config.uncertainty_weight_cycle, cycle_risk)) if risk is not None)
     )
     left_variance = float(
         np.clip(

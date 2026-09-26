@@ -29,6 +29,7 @@ class ProcessingRequest:
     points: tuple[PointSpec, ...]
     calibration: StereoCalibration
     config: MatcherConfig
+    result_method_label: str | None = None
 
     def __post_init__(self) -> None:
         method_profile(self.method)
@@ -60,6 +61,12 @@ class ProcessingSummary:
     valid_rows: int
     cancelled: bool
     elapsed_s: float
+
+
+@dataclass(frozen=True)
+class BatchProcessingSummary:
+    summaries: tuple[ProcessingSummary, ...]
+    cancelled: bool
 
 
 class StereoVideoProcessor:
@@ -120,6 +127,8 @@ class StereoVideoProcessor:
                     frame_total_ms = (time.perf_counter() - algorithm_started) * 1000.0
                     for result in results:
                         row = {"repeat": 0, **result.as_csv_row(), "frame_total_ms": frame_total_ms}
+                        if request.result_method_label:
+                            row["method"] = request.result_method_label
                         writer.writerow(row)
                         rows_written += 1
                         valid_rows += int(result.status == "valid")
@@ -180,6 +189,67 @@ class ProcessingWorker(QObject):
                 wait_if_paused=self._wait_if_paused,
             )
             self.completed.emit(summary)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+    @Slot(bool)
+    def set_paused(self, paused: bool) -> None:
+        with self._condition:
+            self._paused = bool(paused)
+            if not self._paused:
+                self._condition.notify_all()
+        self.statusChanged.emit("已暂停" if paused else "正在处理")
+
+    @Slot()
+    def stop(self) -> None:
+        with self._condition:
+            self._stopped = True
+            self._paused = False
+            self._condition.notify_all()
+
+    def _should_stop(self) -> bool:
+        with self._condition:
+            return self._stopped
+
+    def _wait_if_paused(self) -> None:
+        with self._condition:
+            while self._paused and not self._stopped:
+                self._condition.wait(timeout=0.2)
+
+
+class BatchProcessingWorker(QObject):
+    """Sequential GUI runner for a predefined thesis experiment group."""
+    frameReady = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+    statusChanged = Signal(str)
+
+    def __init__(self, requests: tuple[ProcessingRequest, ...]) -> None:
+        super().__init__()
+        self.requests = requests
+        self._condition = threading.Condition()
+        self._paused = False
+        self._stopped = False
+
+    @Slot()
+    def run(self) -> None:
+        summaries: list[ProcessingSummary] = []
+        try:
+            for index, request in enumerate(self.requests, start=1):
+                if self._should_stop():
+                    break
+                self.statusChanged.emit(
+                    f"实验 {index}/{len(self.requests)}：{request.result_method_label or request.method}"
+                )
+                summary = StereoVideoProcessor(request).run(
+                    on_frame=self.frameReady.emit,
+                    should_stop=self._should_stop,
+                    wait_if_paused=self._wait_if_paused,
+                )
+                summaries.append(summary)
+                if summary.cancelled:
+                    break
+            self.completed.emit(BatchProcessingSummary(tuple(summaries), self._should_stop()))
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 

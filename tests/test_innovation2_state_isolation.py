@@ -15,6 +15,7 @@ def _observation(
     confirmed_anomaly: bool = False,
     legitimate_motion: bool = False,
     hard_failure: bool = False,
+    geometry_valid: bool | None = None,
 ) -> TimedObservation:
     return TimedObservation(
         frame=frame,
@@ -24,7 +25,7 @@ def _observation(
             confirmed_anomaly=confirmed_anomaly,
             legitimate_motion=legitimate_motion,
             hard_failure=hard_failure,
-            geometry_valid=not hard_failure,
+            geometry_valid=(not hard_failure) if geometry_valid is None else geometry_valid,
             evidence_sufficient=not hard_failure,
             post_correction_safe=not hard_failure,
         ),
@@ -139,3 +140,89 @@ def test_large_correction_is_complete_or_abstains_never_partial() -> None:
     assert outcome.correction_applied is False
     assert outcome.corrected_xyz_mm is None
     assert "correction_unauthorized" in outcome.candidate_safety.failed_reasons
+
+
+def test_recovery_consistency_keeps_the_existing_10_mm_inclusive_boundary() -> None:
+    at_boundary = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    at_boundary.process(_observation(0, 0.0))
+    at_boundary.process(_observation(1, 0.0))
+    at_boundary.process(_observation(2, 80.0, confirmed_anomaly=True))
+
+    boundary = at_boundary.process(_observation(3, 10.0))
+
+    beyond_boundary = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    beyond_boundary.process(_observation(0, 0.0))
+    beyond_boundary.process(_observation(1, 0.0))
+    beyond_boundary.process(_observation(2, 80.0, confirmed_anomaly=True))
+    beyond = beyond_boundary.process(_observation(3, 10.001))
+
+    assert boundary.state is I2State.RECOVERY
+    assert beyond.state is I2State.QUARANTINED
+
+
+def test_stale_predictor_reacquires_after_two_stable_valid_observations() -> None:
+    processor = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    anomalous = processor.process(_observation(2, 80.0, confirmed_anomaly=True))
+    first = processor.process(_observation(3, 30.0))
+    reacquired = processor.process(_observation(4, 34.0))
+
+    assert anomalous.corrected_xyz_mm == (0.0, 0.0, 2000.0)
+    assert first.state is I2State.QUARANTINED
+    assert first.reason == "reacquisition_first_clean_observation"
+    assert reacquired.state is I2State.NORMAL
+    assert reacquired.reason == "reacquisition_confirmed"
+    assert [item.frame for item in processor.trusted_history] == [3, 4]
+
+
+def test_stale_predictor_never_reacquires_from_one_valid_observation() -> None:
+    processor = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    processor.process(_observation(2, 80.0, confirmed_anomaly=True))
+
+    first = processor.process(_observation(3, 30.0))
+
+    assert first.state is I2State.QUARANTINED
+    assert [item.frame for item in processor.trusted_history] == [0, 1]
+
+
+def test_stale_predictor_never_reacquires_from_an_inconsistent_pair() -> None:
+    processor = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    processor.process(_observation(2, 80.0, confirmed_anomaly=True))
+    processor.process(_observation(3, 30.0))
+
+    rejected = processor.process(_observation(4, 45.0))
+
+    assert rejected.state is I2State.QUARANTINED
+    assert rejected.reason == "reacquisition_pair_inconsistent"
+    assert [item.frame for item in processor.trusted_history] == [0, 1]
+
+
+def test_stale_predictor_never_reacquires_a_confirmed_anomaly_or_hard_failure() -> None:
+    processor = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    processor.process(_observation(2, 80.0, confirmed_anomaly=True))
+    anomaly = processor.process(_observation(3, 30.0, confirmed_anomaly=True))
+    hard_failure = processor.process(_observation(4, float("nan"), hard_failure=True))
+
+    assert anomaly.state is I2State.QUARANTINED
+    assert hard_failure.state is I2State.QUARANTINED
+    assert [item.frame for item in processor.trusted_history] == [0, 1]
+
+
+def test_stale_predictor_never_reacquires_an_invalid_geometry_observation() -> None:
+    processor = EnhancedPointProcessor(recovery_consistency_mm=10.0)
+    processor.process(_observation(0, 0.0))
+    processor.process(_observation(1, 0.0))
+    processor.process(_observation(2, 80.0, confirmed_anomaly=True))
+
+    invalid = processor.process(_observation(3, 30.0, geometry_valid=False))
+
+    assert invalid.state is I2State.QUARANTINED
+    assert invalid.reason == "quarantine_unresolved"
+    assert [item.frame for item in processor.trusted_history] == [0, 1]

@@ -1,0 +1,10 @@
+dataset_root: "E:/数据集"
+index_path: "cache/dataset_index.jsonl"
+results_root: "results"
+
+# Safe defaults: never run the complete dataset unless --mode full is explicit.
+smoke_per_dataset: 10
+development_fraction: 0.05
+development_max_frames: 500
+default_method: "M3"
+

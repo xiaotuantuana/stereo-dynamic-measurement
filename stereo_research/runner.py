@@ -18,6 +18,29 @@ from .models import METHOD_NAMES, MatcherConfig, MethodName, SequenceManifest, m
 from .pipeline import TemporalStereoPipeline
 
 
+SHADOW_CSV_FIELDS = [
+    "shadow_input_x_m", "shadow_input_y_m", "shadow_input_z_m", "shadow_input_stage",
+    "candidate_corrected_x_m", "candidate_corrected_y_m", "candidate_corrected_z_m",
+    "c_phy", "c_phy_valid", "c_phy_valid_terms", "c_phy_missing_terms",
+    "transient_protected", "fault_class", "fault_confidence", "recommended_recovery",
+    "r_2d3d", "r_temporal", "r_spatial", "r_frequency", "r_phase", "r_coherence",
+    "r_lr", "r_epi", "r_fb", "r_ref", "r_calib",
+]
+
+ACCURACY_POLICY_CSV_FIELDS = [
+    "accuracy_policy_enabled", "precision_policy_warmup", "target_metric",
+    "target_x_mm", "target_y_mm", "target_z_mm",
+    "required_sigma_d_px", "estimated_sigma_d_px",
+    "estimated_sigma_x_mm", "estimated_sigma_y_mm", "estimated_sigma_z_mm",
+    "precision_ratio", "precision_feasible", "precision_status", "limiting_axis",
+    "policy_base_search_radius_px", "policy_final_search_radius_px",
+    "policy_refinement_level", "policy_retry_budget", "policy_precision_retry_count",
+    "policy_acceptance_reason", "policy_reason",
+    "retry_triggered", "retry_candidate_accepted", "retry_sigma_before_px",
+    "retry_sigma_after_px", "retry_match_cost_before", "retry_match_cost_after",
+    "retry_lr_error_before_px", "retry_lr_error_after_px",
+]
+
 CSV_FIELDS = [
     "repeat",
     "method",
@@ -117,6 +140,7 @@ CSV_FIELDS = [
     "camera_ty_mm",
     "camera_tz_mm",
     "camera_rotation_angle_deg",
+    "camera_rx_deg", "camera_ry_deg", "camera_rz_deg",
     "compensated_X_m",
     "compensated_Y_m",
     "compensated_Z_m",
@@ -129,7 +153,15 @@ CSV_FIELDS = [
     "compensated_delta_X_mm",
     "compensated_delta_Y_mm",
     "compensated_delta_Z_mm",
-]
+    "neighbor_disparity_mad",
+    "predicted_disparity", "previous_disparity", "disparity_velocity", "prediction_residual_px",
+    "adaptive_search_radius", "search_radius_reason",
+    "confidence_texture", "confidence_photo", "confidence_margin", "confidence_flow",
+    "confidence_lr", "confidence_cycle", "confidence_icgn", "confidence_curvature",
+    "confidence_temporal", "confidence_neighbor", "confidence_total", "confidence_state",
+    "frame_timestamp_s", "timestamp_left_s", "timestamp_right_s", "sync_error_ms", "timestamp_source",
+    "timestamp_gt_s", "X_gt", "Y_gt", "Z_gt", "gt_valid", "gt_source",
+] + SHADOW_CSV_FIELDS + ACCURACY_POLICY_CSV_FIELDS
 
 
 def split_side_by_side(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -150,9 +182,18 @@ def load_calibration(value: str) -> StereoCalibration:
     )
 
 
+def resolve_manifest_calibration(manifest_path: str | Path, value: str) -> StereoCalibration:
+    if value == "builtin_640x480":
+        return load_calibration(value)
+    path = Path(value)
+    if not path.is_absolute():
+        path = (Path(manifest_path).resolve().parent / path).resolve()
+    return load_calibration(str(path))
+
+
 def run_manifest(
     manifest_path: str | Path,
-    methods: Iterable[str] = ("sgbm", "local", "local_flow", "full"),
+    methods: Iterable[str] = ("M0", "M1", "M2", "M3"),
     config: MatcherConfig | None = None,
     repeats: int = 1,
     warmup_frames: int = 30,
@@ -169,12 +210,7 @@ def run_manifest(
     for method in methods:
         method_profile(method)
         method_names.append(cast(MethodName, method))
-    calibration_value = manifest.calibration
-    if calibration_value != "builtin_640x480":
-        calibration_path = Path(calibration_value)
-        if not calibration_path.is_absolute():
-            calibration_value = str((Path(manifest_path).resolve().parent / calibration_path).resolve())
-    calibration = load_calibration(calibration_value)
+    calibration = resolve_manifest_calibration(manifest_path, manifest.calibration)
     matcher_config = config or MatcherConfig()
     output_dir = manifest.output_dir or manifest.points_path.parent / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -223,6 +259,63 @@ def run_manifest(
     return outputs
 
 
+def run_confidence_suite(
+    manifest_path: str | Path,
+    config: MatcherConfig | None = None,
+    repeats: int = 1,
+    warmup_frames: int = 30,
+) -> dict[str, Path]:
+    """Run C0–C3 on the identical M3 matching backbone."""
+    base = config or MatcherConfig()
+    modes = {"M3_C0": "none", "M3_C1": "single_margin", "M3_C2": "multi_reject", "M3_C3": "closed_loop"}
+    manifest = SequenceManifest.from_json(manifest_path)
+    output_dir = (manifest.output_dir or manifest.points_path.parent / "results")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    calibration = resolve_manifest_calibration(manifest_path, manifest.calibration)
+    outputs: dict[str, Path] = {}
+    for label, mode in modes.items():
+        rows: list[dict[str, object]] = []
+        for repeat in range(repeats):
+            rows.extend(_run_method_once(manifest, calibration, replace(base, confidence_mode=mode, enable_camera_compensation=False), "THESIS_FULL", repeat, warmup_frames))
+        for row in rows:
+            row["method"] = label
+        output = output_dir / f"{label}.csv"
+        with output.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            writer.writeheader(); writer.writerows(rows)
+        outputs[label] = output
+    return outputs
+
+
+def run_compensation_suite(
+    manifest_path: str | Path,
+    config: MatcherConfig | None = None,
+    repeats: int = 1,
+    warmup_frames: int = 30,
+) -> dict[str, Path]:
+    """Run R0–R2 with identical Innovation-1 and Innovation-2 settings."""
+    manifest = SequenceManifest.from_json(manifest_path)
+    output_dir = manifest.output_dir or manifest.points_path.parent / "results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    calibration = resolve_manifest_calibration(manifest_path, manifest.calibration)
+    base = config or MatcherConfig()
+    modes = {"THESIS_FULL_R0": "none", "THESIS_FULL_R1": "single_reference", "THESIS_FULL_R2": "multi_reference_rigid"}
+    outputs: dict[str, Path] = {}
+    for label, mode in modes.items():
+        rows: list[dict[str, object]] = []
+        variant = replace(base, confidence_mode="closed_loop", camera_compensation_mode=mode, enable_camera_compensation=(mode != "none"))
+        for repeat in range(repeats):
+            rows.extend(_run_method_once(manifest, calibration, variant, "THESIS_FULL", repeat, warmup_frames))
+        for row in rows:
+            row["method"] = label
+        output = output_dir / f"{label}.csv"
+        with output.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            writer.writeheader(); writer.writerows(rows)
+        outputs[label] = output
+    return outputs
+
+
 def run_ablation_suite(
     manifest_path: str | Path,
     config: MatcherConfig | None = None,
@@ -238,14 +331,7 @@ def run_ablation_suite(
         raise ValueError("repeats must be at least 1")
     if warmup_frames < 0:
         raise ValueError("warmup_frames must be non-negative")
-    calibration_value = manifest.calibration
-    if calibration_value != "builtin_640x480":
-        calibration_path = Path(calibration_value)
-        if not calibration_path.is_absolute():
-            calibration_value = str(
-                (Path(manifest_path).resolve().parent / calibration_path).resolve()
-            )
-    calibration = load_calibration(calibration_value)
+    calibration = resolve_manifest_calibration(manifest_path, manifest.calibration)
     base = config or MatcherConfig()
     variants: dict[str, tuple[MethodName, MatcherConfig]] = {
         "full": ("full_quality", base),
@@ -351,6 +437,8 @@ def _run_method_once(
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {manifest.video}")
     capture.set(cv2.CAP_PROP_POS_FRAMES, manifest.start_frame)
+    fps = float(capture.get(cv2.CAP_PROP_FPS)) or 0.0
+    timestamps = _load_timestamps(manifest.timestamps)
     pipeline: TemporalStereoPipeline | None = None
     rows: list[dict[str, object]] = []
     frame_index = manifest.start_frame
@@ -386,6 +474,20 @@ def _run_method_once(
                     if frame_index < manifest.start_frame + warmup_frames
                     else frame_total_ms
                 )
+                hardware = timestamps.get(frame_index) if timestamps else None
+                if hardware is not None:
+                    left_timestamp, right_timestamp = hardware
+                    timestamp = (left_timestamp + right_timestamp) / 2.0
+                    timestamp_source, sync_error = "hardware", abs(left_timestamp - right_timestamp) * 1000.0
+                else:
+                    timestamp = (frame_index - manifest.start_frame) / fps if fps > 0 else None
+                    left_timestamp = right_timestamp = timestamp
+                    timestamp_source, sync_error = ("video_fps", 0.0) if timestamp is not None else ("unavailable", None)
+                row.update({
+                    "frame_timestamp_s": timestamp, "timestamp_left_s": left_timestamp,
+                    "timestamp_right_s": right_timestamp, "sync_error_ms": sync_error,
+                    "timestamp_source": timestamp_source,
+                })
                 rows.append(row)
             frame_index += 1
     finally:
@@ -395,3 +497,17 @@ def _run_method_once(
             f"No frames were read from {manifest.video} at frame {manifest.start_frame}"
         )
     return rows
+
+
+def _load_timestamps(path: Path | None) -> dict[int, tuple[float, float]]:
+    if path is None:
+        return {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    values: dict[int, tuple[float, float]] = {}
+    for row in rows:
+        frame_text = row.get("frame") or row.get("frame_id")
+        if frame_text is None:
+            raise ValueError("Timestamp CSV needs frame or frame_id")
+        values[int(frame_text)] = (float(row["left_timestamp_s"]), float(row["right_timestamp_s"]))
+    return values
