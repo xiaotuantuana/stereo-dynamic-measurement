@@ -1,0 +1,10 @@
+{
+  "name": "car_smoke_from_frame_250",
+  "video": "../../car.avi",
+  "start_frame": 250,
+  "end_frame": 350,
+  "calibration": "../../configs/calibration_640x480.json",
+  "points": "points.json",
+  "ground_truth": null,
+  "output_dir": "results"
+}

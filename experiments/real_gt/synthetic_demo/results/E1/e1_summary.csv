@@ -1,0 +1,2 @@
+﻿data_source,status,sequence_id,split,distance_m,baseline_mm,target_sigma_z_mm,method,repeat,Z_RMSE_mm,XYZ_RMSE_mm,Estimated_sigma_Z_mm,Required_sigma_d_px,Estimated_sigma_d_px,Precision_Status_Distribution,Target_Attainment,Refinement_Level,Retry_Count,Runtime_ms,Valid_Rate,Coverage_1sigma,Coverage_2sigma,Coverage_3sigma,alignment_success_rate
+SYNTHETIC_DRY_RUN,SYNTHETIC_DRY_RUN,SYN_E1_001,evaluation,2.0,120.0,5.0,M3,1,2.9154759474226504,2.9154759474226504,4.65,0.08,0.11,"{""MET"": 1, ""VALID_BUT_PRECISION_UNMET"": 1}",1.0,1.5,0.5,15.25,1.0,1.0,1.0,1.0,1.0

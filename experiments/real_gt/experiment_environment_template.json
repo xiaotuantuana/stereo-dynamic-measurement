@@ -1,0 +1,23 @@
+{
+  "data_source": "REAL",
+  "experiment_id": "EXPERIMENT_ID",
+  "sequence_id": "SEQUENCE_ID",
+  "date": "YYYY-MM-DD",
+  "method": "research_full",
+  "resolution": "640x480",
+  "fps": 30.0,
+  "baseline_mm": 120.0,
+  "calibration_id": "CALIBRATION_ID",
+  "calibration_file": "calibration.json",
+  "target_sigma_z_mm": null,
+  "algorithm": {
+    "enable_target_accuracy_policy": false,
+    "enable_icgn": true,
+    "max_precision_retry": 1,
+    "uncertainty_min_disparity_variance_px2": 0.0025
+  },
+  "git": {
+    "revision": "captured by software",
+    "status": "captured read-only by software"
+  }
+}

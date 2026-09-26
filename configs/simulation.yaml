@@ -1,0 +1,20 @@
+camera:
+  name: default-synthetic-rig
+  image_size: [640, 480]
+  K_left: [[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]]
+  D_left: [0.0, 0.0, 0.0, 0.0, 0.0]
+  K_right: [[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]]
+  D_right: [0.0, 0.0, 0.0, 0.0, 0.0]
+  R: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+  T: [-120.0, 0.0, 0.0]
+  unit: mm
+simulation:
+  duration_s: 5.0
+  fps: 30.0
+  image_noise_std_px: 0.10
+  localization_noise_std_px: 0.05
+  random_seed: 7
+structure:
+  trajectory_kind: impact_decay
+  frequency_hz: 2.0
+output_dir: ../outputs/simulation

@@ -1,0 +1,8 @@
+physics_validation:
+  fs_hz: 100.0
+  duration_s: 5.0
+  frequency_hz: 5.0
+  jump_frame: 250
+  jump_mm: 80.0
+  threshold: 0.65
+  output_dir: ../outputs/innovation2

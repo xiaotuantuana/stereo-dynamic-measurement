@@ -1,0 +1,46 @@
+.worktrees/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime-only outputs. Curated research artefacts under outputs/ remain visible
+# to Git so they can be deliberately versioned when needed.
+outputs/tmp/
+outputs/debug/
+outputs/**/tmp/
+outputs/**/debug/
+stereo_app_outputs/
+stereo_point_cloud_outputs/
+experiments/**/results/
+experiments/**/report/
+experiments/**/report_*/
+experiments/gui_validation/
+
+# Large local assets and generated model artifacts
+*.avi
+*.mp4
+*.mov
+*.mkv
+*.pt
+*.pth
+*.onnx
+*.engine
+*.wts
+*.dll
+*.pdb
+*.obj
+*.lib
+*.zip
+
+# Runtime logs
+*.log

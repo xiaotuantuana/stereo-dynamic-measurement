@@ -1,0 +1,3 @@
+frame,timestamp_s,point_id,gt_x_mm,gt_y_mm,gt_z_mm,gt_sigma_x_mm,gt_sigma_y_mm,gt_sigma_z_mm,data_source,notes
+0,0.000,P1,10.0,20.0,2000.0,0.1,0.1,0.2,SYNTHETIC_DRY_RUN,SYNTHETIC EXAMPLE ONLY
+1,0.033,P1,10.0,20.0,2000.0,0.1,0.1,0.2,SYNTHETIC_DRY_RUN,SYNTHETIC EXAMPLE ONLY

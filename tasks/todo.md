@@ -1,0 +1,22 @@
+# Phase 3 Checklist
+
+- [x] A1 Sequence model/grouping contract
+- [x] A2 Stateful runner lifecycle
+- [x] A3 Sequence metrics/result bundle
+- [x] A checkpoint: smoke + state isolation + regression
+- [x] B1 Controlled stereo image sequence
+- [x] B2 M0/M1/M2/M3 stateful ablation
+- [x] B3 Occlusion/discontinuity diagnostics
+- [x] B checkpoint: real stateful method difference
+- [x] C1 Innovation2 scenario matrix
+- [x] C2 temporal/correction metrics
+- [x] C3 evidence participation audit
+- [x] C checkpoint: correction benefit and false-correction reporting (acceptance remains blocked by worsened jump count)
+- [x] D1 severity-aware perturbations
+- [x] D2 diagnosis/confusion/safety metrics
+- [x] D3 failure/case-study exports
+- [x] D checkpoint: label isolation and retention
+- [x] E1 unified experiment summary
+- [x] E2 gated 500-level run
+- [x] E3 Phase 3 audit/report and scale recommendation
+- [x] Final full pytest: 312 passed, no regressions

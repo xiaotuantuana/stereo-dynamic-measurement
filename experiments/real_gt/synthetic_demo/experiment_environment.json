@@ -1,0 +1,28 @@
+{
+  "data_source": "SYNTHETIC_DRY_RUN",
+  "experiment_id": "synthetic-demo",
+  "sequence_id": "SYN_E0_001",
+  "date": "2026-08-21",
+  "method": "M3",
+  "resolution": "8x6",
+  "fps": 30.0,
+  "baseline_mm": 120.0,
+  "calibration_id": "synthetic_demo_120mm",
+  "calibration_file": "calibration.json",
+  "target_sigma_z_mm": 5.0,
+  "algorithm": {
+    "enable_target_accuracy_policy": false,
+    "target_metric": "sigma",
+    "enable_icgn": true,
+    "icgn_max_iterations": 20,
+    "icgn_epsilon": 0.001,
+    "max_precision_retry": 1,
+    "uncertainty_base_disparity_variance_px2": 0.01,
+    "uncertainty_min_disparity_variance_px2": 0.0025,
+    "uncertainty_max_disparity_variance_px2": 4.0
+  },
+  "git": {
+    "revision": "872b8dba6294eade34ca4031237960441227571d",
+    "status": "M stereo_dynamic_measurement/innovation1/baseline_experiment.py\n M stereo_dynamic_measurement/innovation1/precision_planner.py\n M stereo_dynamic_measurement/innovation2/physics_confidence.py\n M stereo_dynamic_measurement/innovation2/physics_validation.py\n M stereo_dynamic_measurement/innovation2/trajectory_corrector.py\n M stereo_dynamic_measurement/innovation3/fault_classifier.py\n M stereo_dynamic_measurement/innovation3/fault_fingerprint.py\n M stereo_dynamic_measurement/run_innovation1_experiment.py\n M stereo_research/annotate.py\n M stereo_research/camera_compensation.py\n M stereo_research/gui/processing.py\n M stereo_research/gui/settings.py\n M stereo_research/gui/window.py\n M stereo_research/local_matching.py\n M stereo_research/metrics.py\n M stereo_research/models.py\n M stereo_research/pipeline.py\n M stereo_research/report.py\n M stereo_research/run.py\n M stereo_research/runner.py\n M stereo_research/uncertainty.py\n M tests/test_gui_app.py\n M tests/test_innovation1_baseline_experiment.py\n M tests/test_innovation2_correction.py\n M tests/test_innovation2_validation.py\n?? CODE_AUDIT_REPORT.md\n?? CODE_AUDIT_REPORT_2026-08-20.md\n?? FIRST_ROUND_SHADOW_MODE_REPORT.md\n?? SECOND_ROUND_INNOVATION1_REPORT.md\n?? THIRD_ROUND_UNCERTAINTY_EVALUATION_REPORT.md\n?? backup_before_refactor/\n?? docs/superpowers/specs/2026-08-20-innovation1-target-accuracy-policy-design.md\n?? docs/superpowers/specs/2026-08-20-innovation2-3-shadow-mode-design.md\n?? docs/superpowers/specs/2026-08-20-uncertainty-calibration-evaluation-design.md\n?? docs/superpowers/specs/2026-08-21-real-experiment-preflight-design.md\n?? evaluate_e0.py\n?? evaluate_e1.py\n?? experiments/real_gt/\n?? run_synthetic_dry_run.py\n?? stereo_dynamic_measurement/innovation2/transient_gate.py\n?? stereo_research/accuracy_policy.py\n?? stereo_research/confidence.py\n?? stereo_research/evaluation_runner.py\n?? stereo_research/ground_truth.py\n?? stereo_research/real_experiment.py\n?? stereo_research/shadow_analysis.py\n?? stereo_research/uncertainty_evaluation.py\n?? tasks/innovation1-target-accuracy-plan.md\n?? tasks/innovation1-target-accuracy-todo.md\n?? tasks/innovation23-shadow-plan.md\n?? tasks/innovation23-shadow-todo.md\n?? tasks/real-experiment-preflight-plan.md\n?? tasks/real-experiment-preflight-todo.md\n?? tasks/uncertainty-calibration-evaluation-plan.md\n?? tasks/uncertainty-calibration-evaluation-todo.md\n?? tests/test_e0_e1_experiment_interfaces.py\n?? tests/test_real_experiment_preflight.py\n?? tests/test_shadow_fault_adapter.py\n?? tests/test_shadow_pipeline.py\n?? tests/test_shadow_scientific_safety.py\n?? tests/test_shadow_state_isolation.py\n?? tests/test_target_accuracy_csv.py\n?? tests/test_target_accuracy_pipeline.py\n?? tests/test_target_accuracy_planner.py\n?? tests/test_target_accuracy_policy.py\n?? tests/test_thesis_experiment_controls.py\n?? tests/test_uncertainty_evaluation.py\n?? validate_real_experiment.py"
+  }
+}

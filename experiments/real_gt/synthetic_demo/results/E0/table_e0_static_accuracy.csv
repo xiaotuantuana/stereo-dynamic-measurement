@@ -1,0 +1,2 @@
+﻿data_source,status,Distance,Method,N,X_RMSE_mm,Y_RMSE_mm,Z_RMSE_mm,XYZ_RMSE_mm,Z_Bias_mm,Z_Std_mm,Valid_Rate
+SYNTHETIC_DRY_RUN,SYNTHETIC_DRY_RUN,2.0,M3,2,0.0,0.0,2.9154759474226504,2.9154759474226504,2.5,1.5,1.0

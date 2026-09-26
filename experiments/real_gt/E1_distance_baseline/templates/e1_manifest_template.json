@@ -1,0 +1,23 @@
+{
+  "experiment_type": "E1",
+  "experiment_id": "REAL_E1_EXPERIMENT_ID",
+  "gt_unit": "mm",
+  "data_source": "REAL_E1",
+  "conditions": [
+    {
+      "sequence_id": "REAL_E1_SEQUENCE_ID",
+      "split": "evaluation",
+      "distance_m": 2.0,
+      "baseline_mm": 120.0,
+      "target_sigma_z_mm": 5.0,
+      "method": "research_full",
+      "repeat": 1,
+      "calibration_id": "CALIBRATION_ID",
+      "calibration": "../calibration/calibration_120mm.json",
+      "measurement": "../evaluation/measurement.csv",
+      "gt": "../evaluation/gt.csv",
+      "alignment_mode": "frame",
+      "max_time_offset_ms": 20
+    }
+  ]
+}

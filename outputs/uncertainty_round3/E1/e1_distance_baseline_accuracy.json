@@ -1,0 +1,16 @@
+{
+  "status": "DATA_REQUIRED",
+  "conditions": [
+    {
+      "distance_m": 2.0,
+      "baseline_mm": 120.3559901,
+      "target_sigma_z_mm": 10.0,
+      "method": "research_full",
+      "repeat": 1,
+      "calibration_id": "builtin_640x480",
+      "calibration": "../../configs/calibration_640x480.json",
+      "measurement": "../../experiments/car/results/research_full.csv",
+      "evaluation_status": "DATA_REQUIRED"
+    }
+  ]
+}

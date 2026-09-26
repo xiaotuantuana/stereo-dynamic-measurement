@@ -1,0 +1,22 @@
+{
+  "experiment_type": "E0",
+  "experiment_id": "REAL_E0_EXPERIMENT_ID",
+  "gt_unit": "mm",
+  "data_source": "REAL_E0",
+  "sequences": [
+    {
+      "sequence_id": "REAL_E0_SEQUENCE_ID",
+      "split": "evaluation",
+      "measurement_csv": "../evaluation/measurement.csv",
+      "gt_csv": "../evaluation/gt.csv",
+      "alignment_mode": "frame",
+      "max_time_offset_ms": 20,
+      "calibration_id": "CALIBRATION_ID",
+      "distance_m": 2.0,
+      "baseline_mm": 120.0,
+      "method": "research_full",
+      "repeat": 1,
+      "notes": "Replace every placeholder before use"
+    }
+  ]
+}

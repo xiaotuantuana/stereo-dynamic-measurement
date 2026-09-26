@@ -1,0 +1,8 @@
+baseline_experiment:
+  baselines_mm: [60, 100, 140, 180, 220, 260, 300]
+  distances_mm: [1000, 2000, 3000, 4000, 5000]
+  disparity_noises_px: [0.02, 0.05, 0.1, 0.2]
+  focal_length_px: 800.0
+  samples_per_condition: 1000
+  random_seed: 7
+  output_dir: ../outputs/innovation1

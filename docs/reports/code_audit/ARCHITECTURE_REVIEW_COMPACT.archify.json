@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "双目动态测量工程：已验证代码架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [970, 550]
+  },
+  "components": [
+    {"id": "video", "type": "external", "label": "双目视频 / 相机输入", "sublabel": "GUI ProcessingRequest.video_path", "pos": [40, 210], "size": [160, 58]},
+    {"id": "gui", "type": "frontend", "label": "桌面 GUI 视频处理器", "sublabel": "StereoVideoProcessor", "pos": [260, 210], "size": [170, 58]},
+    {"id": "pipeline", "type": "backend", "label": "核心时序双目管线", "sublabel": "TemporalStereoPipeline", "tag": "共享运行时核心", "pos": [500, 210], "size": [190, 64]},
+    {"id": "i1", "type": "backend", "label": "创新点一：精度规划", "sublabel": "precision_planner", "pos": [750, 210], "size": [180, 58]},
+    {"id": "guiOutput", "type": "database", "label": "GUI 测量结果", "sublabel": "逐帧 CSV", "pos": [260, 50], "size": [170, 58]},
+    {"id": "manifest", "type": "external", "label": "数据清单与标定文件", "sublabel": "DatasetSample / calibration", "pos": [260, 360], "size": [170, 58]},
+    {"id": "benchmark", "type": "backend", "label": "离线基准运行器", "sublabel": "experiment.benchmark.runner", "pos": [500, 360], "size": [170, 58]},
+    {"id": "fault", "type": "backend", "label": "故障注入基准", "sublabel": "benchmark_faults.run_fault_benchmark", "pos": [30, 460], "size": [180, 58]},
+    {"id": "orchestrator", "type": "backend", "label": "故障诊断与恢复编排器", "sublabel": "StereoMeasurementOrchestrator", "pos": [280, 460], "size": [190, 58]},
+    {"id": "i3", "type": "backend", "label": "创新点三：恢复策略", "sublabel": "RuleDiagnosticEngine + RecoveryManager", "pos": [540, 460], "size": [180, 58]}
+  ],
+  "connections": [
+    {"id": "video-gui", "from": "video", "to": "gui", "label": "视频帧", "variant": "emphasis"},
+    {"id": "gui-pipeline", "from": "gui", "to": "pipeline", "label": "initialize / step", "variant": "emphasis", "labelAt": [465, 295]},
+    {"id": "pipeline-i1", "from": "pipeline", "to": "i1", "label": "精度策略"},
+    {"id": "gui-output", "from": "gui", "to": "guiOutput", "label": "逐帧 CSV", "fromSide": "top", "toSide": "bottom"},
+    {"id": "manifest-benchmark", "from": "manifest", "to": "benchmark", "label": "样本与 GT"},
+    {"id": "benchmark-pipeline", "from": "benchmark", "to": "pipeline", "label": "评估调用", "fromSide": "top", "toSide": "bottom"},
+    {"id": "fault-orchestrator", "from": "fault", "to": "orchestrator", "label": "观测与重测", "variant": "emphasis"},
+    {"id": "orchestrator-i3", "from": "orchestrator", "to": "i3", "label": "诊断与恢复"}
+  ]
+}

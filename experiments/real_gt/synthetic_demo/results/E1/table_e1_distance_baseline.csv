@@ -1,0 +1,2 @@
+﻿data_source,status,Distance,Baseline,Target_sigma_Z,Method,Z_RMSE,Estimated_sigma_Z,Target_Attainment,Retry_Count,Runtime,Valid_Rate
+SYNTHETIC_DRY_RUN,SYNTHETIC_DRY_RUN,2.0,120.0,5.0,M3,2.9154759474226504,4.65,1.0,0.5,15.25,1.0

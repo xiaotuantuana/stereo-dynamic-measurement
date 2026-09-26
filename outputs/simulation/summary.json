@@ -1,0 +1,23 @@
+{
+  "unit": "mm",
+  "sample_count": 604,
+  "frame_count": 151,
+  "rmse_3d_mm": 6.467357759764401,
+  "error_x_rmse_mm": 0.6123201590749808,
+  "error_y_rmse_mm": 0.2016722848455435,
+  "error_z_rmse_mm": 6.435146362368177,
+  "absolute_x_rmse_mm": 0.6123201590749808,
+  "absolute_y_rmse_mm": 0.2016722848455435,
+  "absolute_z_rmse_mm": 6.435146362368177,
+  "absolute_3d_rmse_mm": 6.467357759764401,
+  "theoretical_depth_sigma_mm": 6.588078458684127,
+  "baseline_mm": 120.0,
+  "image_noise_std_px": 0.1,
+  "localization_noise_std_px": 0.05,
+  "displacement_x_rmse_mm": 0.668412390671546,
+  "displacement_y_rmse_mm": 0.2769346432228147,
+  "displacement_z_rmse_mm": 7.5719027549209486,
+  "displacement_3d_rmse_mm": 7.606390684851761,
+  "peak_displacement_error_mm": 13.334543872139925,
+  "peak_displacement_error_percent": 93.96328361215295
+}

@@ -1,0 +1,2 @@
+﻿data_source,status,Distance,Baseline,Target_sigma_Z,Method,Z_RMSE,Estimated_sigma_Z,Target_Attainment,Retry_Count,Runtime,Valid_Rate
+SYNTHETIC_DRY_RUN,TEMPLATE_ONLY,,,,,,,,,,
